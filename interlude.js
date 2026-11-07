@@ -1,7 +1,7 @@
 //@name interlude
-//@display-name Interlude v1.3.0
+//@display-name Interlude v1.3.1
 //@api 3.0
-//@version 1.3.0
+//@version 1.3.1
 //@update-url https://raw.githubusercontent.com/Nicered/interlude-risu/main/interlude.js
 //@arg model_slot string 쓸 모델. aux는 Risu 보조 모델, main은 Risu 메인 모델입니다.
 //@arg nai_key string NovelAI API 키 (사진 기능). Interlude 설정 → 시작 준비에서 입력합니다.
@@ -179,7 +179,7 @@
 
 //#endregion
 //#region src/core/constants.js
-	const PLUGIN_VERSION = "1.3.0";
+	const PLUGIN_VERSION = "1.3.1";
 	const STORE_PREFIX = "interlude:v1:";
 	const STORY_CHARS = 16e3;
 	const SUMMARY_CHARS = 6e3;
@@ -378,11 +378,12 @@
 		const epoch = systemEpoch;
 		systemQueue = systemQueue.then(async () => {
 			if (epoch !== systemEpoch || !systemRows) return;
-			let data = JSON.stringify(systemRows);
-			while (data.length > SYSTEM_BUDGET && systemRows.length > 1) {
-				systemRows.pop();
-				data = JSON.stringify(systemRows);
-			}
+			const parts = systemRows.map((row) => JSON.stringify(row));
+			let count = parts.length;
+			let length = 2 + parts.reduce((sum, part) => sum + part.length, 0) + Math.max(0, count - 1);
+			while (length > SYSTEM_BUDGET && count > 1) length -= parts[--count].length + 1;
+			systemRows.length = count;
+			const data = "[" + parts.slice(0, count).join(",") + "]";
 			await risuai.pluginStorage.setItem(SYSTEM_KEY, data);
 			systemStorageError = false;
 		}).catch(() => {
@@ -2514,12 +2515,26 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		} : null;
 		if (!running) return null;
 		const { job } = running;
+		const a = running.id === "analysis" ? job : null;
+		const now = a?.current?.size ? [...a.current].join(", ") : "";
+		const pct = a?.total ? Math.round(a.done / a.total * 100) : 0;
+		const mid = a ? h("span", { class: "mid" }, h("span", { class: "jobtext" }, running.text, now ? h("span", { "data-t": "job-now" }, ` · 지금: ${now}`) : null, a.failed ? h("span", {
+			class: "jobfail",
+			"data-t": "job-failed"
+		}, ` · 실패 ${a.failed}`) : null), h("span", {
+			class: "jobprog",
+			role: "progressbar",
+			"aria-valuemin": "0",
+			"aria-valuemax": String(a.total),
+			"aria-valuenow": String(a.done),
+			"data-t": "job-progress"
+		}, h("i", { style: `width:${pct}%` }))) : h("span", { class: "mid" }, running.text);
 		return h("div", {
 			class: "jobbar",
 			id: "jobbar",
 			"data-t": running.id,
 			role: "status"
-		}, h("span", { class: "mid" }, running.text), h("button", {
+		}, mid, h("button", {
 			class: "pill",
 			"data-t": "job-stop",
 			disabled: job.stop,
@@ -2816,7 +2831,9 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			done: 0,
 			failed: 0,
 			reused: 0,
-			stop: false
+			stop: false,
+			current: new Set(),
+			failedIds: []
 		};
 		view.analysis = job;
 		render();
@@ -2824,6 +2841,8 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		await inPool(contacts, 3, async (contact) => {
 			if (job.stop) return;
 			let ok = false;
+			job.current.add(contact.name);
+			refreshJobBar();
 			try {
 				ok = await analyzeContact(contact, books, options);
 			} catch (e) {
@@ -2847,7 +2866,11 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				const key = resolvedPersonKey(contact, people);
 				if (!state.contacts.some((c) => resolvedPersonKey(c, people) === key)) state.contacts.push(contact);
 			}
-			if (!ok) job.failed++;
+			job.current.delete(contact.name);
+			if (!ok) {
+				job.failed++;
+				job.failedIds.push(contact.id);
+			}
 			if (ok && contact.analysisReused) job.reused++;
 			job.done++;
 			await saveState(key);
@@ -2862,6 +2885,10 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		if (view.analysis === job) view.analysis = null;
 		if (view.key === key) {
 			view.notice = job.stop ? `분석을 멈췄어요. ${job.done}명을 만들었고, 나머지는 사람 탭의 분석본 만들기로 이어서 할 수 있어요.` : `분석본 ${job.total - job.failed}명 준비 · 기존 분석 재사용 ${job.reused}명${job.failed ? ` · 실패 ${job.failed}명` : ""}`;
+			view.noticeReanalyze = job.failedIds.length ? {
+				notice: view.notice,
+				ids: job.failedIds
+			} : null;
 			render();
 		}
 	}
@@ -2943,6 +2970,177 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 	}
 
 //#endregion
+//#region src/ui/screens/reanalyze.js
+	function statusOf(c) {
+		if (c.cardState === "no-lore") return {
+			label: "로어 없음",
+			can: false,
+			needs: false
+		};
+		if (c.cardState === "failed") return {
+			label: "분석 실패" + (c.cardError ? ` · ${String(c.cardError).slice(0, 60)}` : ""),
+			can: true,
+			needs: true,
+			tone: "fail"
+		};
+		if (c.analysisStale) return {
+			label: "로어 바뀜 · 다시 분석이 필요해요",
+			can: true,
+			needs: true,
+			tone: "stale"
+		};
+		if (!c.card) return {
+			label: "분석본 없음",
+			can: true,
+			needs: true
+		};
+		return {
+			label: "분석됨",
+			can: true,
+			needs: false
+		};
+	}
+	function openReanalyze(ids) {
+		view.reanalyze = {
+			ids: ids ? new Set(ids) : null,
+			selected: null,
+			q: ""
+		};
+		go("reanalyze", { notice: "" });
+	}
+	function reanalyzeScreen(state) {
+		const r = view.reanalyze ||= {
+			ids: null,
+			selected: null,
+			q: ""
+		};
+		const people = state.contacts.filter((c) => c.id !== "me");
+		const ready = people.filter((c) => statusOf(c).can);
+		if (!r.selected) r.selected = new Set(ready.filter((c) => r.ids ? r.ids.has(c.id) : statusOf(c).needs).map((c) => c.id));
+		const selected = r.selected;
+		for (const id of [...selected]) if (!ready.some((c) => c.id === id)) selected.delete(id);
+		const q = normalize(r.q);
+		const match = (c) => !q || normalize(c.name).includes(q) || (c.aliases || []).some((a) => normalize(a).includes(q));
+		const busy = !!view.analysis || !!view.bioBusy;
+		const label = () => `${selected.size}명 다시 분석`;
+		const cost = (n) => `모델 약 ${n}회 · 입력 약 ${(n * ANALYSIS_TOKENS).toLocaleString()}토큰이 들어요.`;
+		const runBtn = h("button", {
+			class: "pill primary",
+			"data-t": "reanalyze-run",
+			disabled: !selected.size || busy,
+			onclick: () => {
+				if (selected.size >= CONFIRM_FROM && !runBtn.dataset.armed) {
+					runBtn.dataset.armed = "1";
+					runBtn.textContent = "한 번 더 누르면 시작";
+					return;
+				}
+				const chosen = state.contacts.filter((c) => selected.has(c.id));
+				view.reanalyze = null;
+				go("list", {
+					tab: "people",
+					notice: ""
+				});
+				void analyzeInBackground(state, chosen, true);
+			}
+		}, label());
+		const costBox = h("div", {
+			class: "notice",
+			"data-t": "reanalyze-cost",
+			hidden: !selected.size
+		}, cost(selected.size));
+		const sync = () => {
+			delete runBtn.dataset.armed;
+			runBtn.textContent = label();
+			runBtn.disabled = !selected.size || busy;
+			costBox.textContent = cost(selected.size);
+			costBox.hidden = !selected.size;
+		};
+		const row = (c) => {
+			const s = statusOf(c);
+			return h("label", {
+				class: "row pick" + (s.can ? "" : " done"),
+				"data-t": "reanalyze-row",
+				"data-name": c.name
+			}, avatar(c, 44), h("span", { class: "mid" }, h("span", { class: "nm" }, c.name), h("span", { class: "pv" }, h("span", {
+				class: "tx" + (s.tone === "fail" ? " danger" : ""),
+				"data-t": "reanalyze-status"
+			}, s.label))), h("input", {
+				type: "checkbox",
+				checked: selected.has(c.id),
+				disabled: !s.can,
+				"aria-label": `${c.name} 선택`,
+				"data-t": "reanalyze-item",
+				"data-name": c.name,
+				onchange: (e) => {
+					if (e.target.checked) selected.add(c.id);
+					else selected.delete(c.id);
+					sync();
+				}
+			}), h("span", { class: "check" }));
+		};
+		const shown = people.filter(match);
+		const needs = shown.filter((c) => statusOf(c).needs), done = shown.filter((c) => statusOf(c).can && !statusOf(c).needs), none = shown.filter((c) => !statusOf(c).can);
+		const body = h("div", {
+			class: "scroll",
+			id: "scroll"
+		});
+		body.append(h("div", { class: "notice" }, "고른 사람을 로어로 다시 분석해요. 이미 분석된 사람도 고를 수 있어요."));
+		if (busy) body.append(h("div", {
+			class: "notice",
+			"data-t": "reanalyze-busy"
+		}, "진행 중인 작업이 끝난 뒤 시작할 수 있어요."));
+		body.append(costBox);
+		body.append(h("div", { class: "actions" }, h("button", {
+			class: "pill",
+			"data-t": "reanalyze-all",
+			onclick: () => {
+				for (const c of shown) if (statusOf(c).can) selected.add(c.id);
+				render();
+			}
+		}, q ? "검색 결과 모두 선택" : "모두 선택"), h("button", {
+			class: "pill",
+			"data-t": "reanalyze-none",
+			onclick: () => {
+				selected.clear();
+				render();
+			}
+		}, "선택 해제"), h("button", {
+			class: "pill",
+			"data-t": "reanalyze-needed",
+			onclick: () => {
+				selected.clear();
+				for (const c of ready) if (statusOf(c).needs) selected.add(c.id);
+				render();
+			}
+		}, "다시 해야 할 사람만")));
+		if (needs.length) body.append(h("div", { class: "sect" }, "다시 해야 할 사람", h("small", {}, `${needs.length}명`)), h("div", { class: "rows" }, needs.map(row)));
+		if (done.length) body.append(h("div", { class: "sect" }, "분석됨", h("small", {}, `${done.length}명`)), h("div", { class: "rows" }, done.map(row)));
+		if (none.length) body.append(h("div", { class: "sect" }, "로어 없음", h("small", {}, `${none.length}명 · 분석할 로어가 없어요`)), h("div", { class: "rows" }, none.map(row)));
+		if (!shown.length) body.append(h("div", { class: "hello" }, h("div", { class: "meta" }, people.length ? "찾는 사람이 없어요." : "아직 사람이 없어요.")));
+		return [
+			h("div", { class: "top line-b" }, backBtn(() => {
+				view.reanalyze = null;
+				go("list", { tab: "people" });
+			}), h("h1", { class: "small" }, "다시 분석"), runBtn),
+			h("label", {
+				class: "search",
+				style: "margin-top:8px"
+			}, icon("search", 16), h("input", {
+				id: "rq",
+				value: r.q,
+				placeholder: "이름으로 찾기",
+				"aria-label": "사람 검색",
+				"data-t": "reanalyze-search",
+				oninput: (e) => {
+					r.q = e.target.value;
+					render(e.target);
+				}
+			})),
+			body
+		];
+	}
+
+//#endregion
 //#region src/ui/screens/list.js
 	function hasAnalyzedProfile(contact) {
 		return !!(contact?.card && (contact.card["정체"] || contact.card["말투"]) && !contact.analysisStale && !["failed", "no-lore"].includes(contact.cardState));
@@ -3001,7 +3199,15 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "pill",
 			"data-t": "notice-pick",
 			onclick: openPicker
-		}, "인물 고르기") : null) : null;
+		}, "인물 고르기") : null, view.noticeReanalyze?.notice === view.notice ? h("button", {
+			class: "pill",
+			"data-t": "notice-reanalyze",
+			onclick: () => {
+				const { ids } = view.noticeReanalyze;
+				view.noticeReanalyze = null;
+				openReanalyze(ids);
+			}
+		}, "실패한 사람 다시 분석") : null) : null;
 		const body = h("div", {
 			class: "scroll",
 			id: "scroll"
@@ -3049,7 +3255,12 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				class: "pill primary",
 				"data-t": "pick-people",
 				onclick: openPicker
-			}, "인물 고르기"), (() => {
+			}, "인물 고르기"), state.contacts.length ? h("button", {
+				class: "pill",
+				"data-t": "reanalyze-open",
+				disabled: !!view.analysis,
+				onclick: () => openReanalyze()
+			}, "다시 분석") : null, (() => {
 				const missing = state.contacts.filter((c) => !c.card && c.cardState !== "no-lore");
 				return missing.length && !view.analysis ? h("button", {
 					class: "pill",
@@ -5914,6 +6125,8 @@ button.row:hover,.rowmain:hover{background:var(--hover)}
 .msg.g-first:not(.me) .b{border-bottom-left-radius:4px}.msg.g-mid:not(.me) .b{border-top-left-radius:4px;border-bottom-left-radius:4px}.msg.g-last:not(.me) .b{border-top-left-radius:4px}
 .msg.g-first.me .b{border-bottom-right-radius:4px}.msg.g-mid.me .b{border-top-right-radius:4px;border-bottom-right-radius:4px}.msg.g-last.me .b{border-top-right-radius:4px}
 .typing{display:flex;gap:4px;padding:11px 12px}.typing i{width:7px;height:7px;border-radius:50%;background:var(--sub);animation:t 1.1s infinite}.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+.typing.story{align-items:center;gap:8px;color:var(--sub);font-size:13px}
+.spin.small{width:14px;height:14px;border-width:2px;flex:none}
 @keyframes t{0%,60%,100%{opacity:.35}30%{opacity:1}}@media (prefers-reduced-motion:reduce){.typing i{animation:none}}
 .error{margin:10px 0;padding:10px;border-radius:10px;background:var(--bg2);color:var(--red);font-size:13px;display:flex;flex-direction:column;gap:8px;align-items:flex-start}
 .composer{flex:none;display:flex;align-items:flex-end;gap:4px;padding:6px 6px calc(8px + env(safe-area-inset-bottom,0px)) 10px}
@@ -5936,7 +6149,12 @@ button.row:hover,.rowmain:hover{background:var(--hover)}
 .set{display:flex;align-items:center;gap:12px;width:100%;min-height:44px;padding:8px 0;text-align:left;font-size:15px;cursor:pointer}.set small{display:block;font-size:13px;color:var(--sub)}.set.danger{color:var(--red)}.set.menu{min-height:56px}.mem{padding:8px 0;border-top:1px solid var(--line)}.mem small{display:block;margin-top:2px}.mem .actions{margin-top:4px}.mem-h{margin:14px 0 4px;font-size:13px;font-weight:600;color:var(--sub)}.set.menu>.ico{color:var(--sub)}
 .sw{flex:none;position:relative;width:42px;height:26px}.sw input{position:absolute;inset:0;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.sw i{display:block;width:100%;height:100%;border-radius:13px;background:var(--line)}.sw i::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .15s}.sw input:checked+i{background:var(--blue)}.sw input:checked+i::after{transform:translateX(16px)}.sw input:focus-visible+i{outline:2px solid var(--blue);outline-offset:2px}
 .sub{color:var(--sub);font-size:13px}
-.jobbar{flex:none;display:flex;align-items:center;gap:8px;margin:6px 12px;padding:6px 6px 6px 12px;border-radius:10px;background:var(--bg2);color:var(--sub);font-size:13px}.row.done{opacity:.6}.actions.flush{padding:8px 0 0}.notice.flush{margin:0 0 8px}.notice .pill{margin-left:8px}
+.jobbar{flex:none;display:flex;align-items:center;gap:8px;margin:6px 12px;padding:6px 6px 6px 12px;border-radius:10px;background:var(--bg2);color:var(--sub);font-size:13px}
+.jobbar .mid{display:flex;flex-direction:column;gap:5px;min-width:0}
+.jobtext{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jobfail{color:var(--red)}
+.jobprog{display:block;height:4px;border-radius:2px;background:var(--line);overflow:hidden}
+.jobprog i{display:block;height:100%;background:var(--blue);transition:width .25s}.row.done{opacity:.6}.actions.flush{padding:8px 0 0}.notice.flush{margin:0 0 8px}.notice .pill{margin-left:8px}
 .kv{display:flex;gap:10px;padding:4px 0;font-size:14px}.kv .k{flex:none;width:76px;color:var(--sub);font-size:13px}.kv span:last-child{min-width:0;overflow-wrap:anywhere}
 .pair{display:grid;gap:6px}.pair input,.term input,.model select,.model input{width:100%;margin-top:6px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);font-size:16px}.model{padding:6px 0}.model input[hidden]{display:none}
 .term{display:flex;gap:4px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}.term .from{font-size:13px;color:var(--sub)}.search.flush{margin:0 0 8px}.top-gap{margin-top:8px}
@@ -6802,10 +7020,15 @@ ${desc}`;
 			if (!selecting && view.msgMenu === m.id) thread.append(messageActions(state, room, m, i, busy));
 		});
 		if (view.editMessage?.key === view.key && view.editMessage.roomId === room.id) thread.append(messageEditPanel(room));
+		const writingStory = storyWriting.has(view.key + "|" + room.id);
 		if (busyRooms.has(view.key + "|" + room.id) && !view.editMessage?.saving) thread.append(h("div", {
 			class: "msg",
 			"data-t": "typing"
-		}, h("span", { class: "slot" }, avatar(members[0], 28)), h("div", { class: "col" }, h("div", {
+		}, h("span", { class: "slot" }, avatar(members[0], 28)), h("div", { class: "col" }, writingStory ? h("div", {
+			class: "b typing story",
+			role: "status",
+			"data-t": "story-writing"
+		}, h("span", { class: "spin small" }), "본편 줄거리 정리 중…") : h("div", {
 			class: "b typing",
 			"aria-label": "입력 중"
 		}, h("i"), h("i"), h("i")))));
@@ -7156,7 +7379,7 @@ ${desc}`;
 			"set-backup",
 			"debug"
 		];
-		const screen = !state.enabled && !shared.includes(view.screen) ? settingsScreen : view.screen === "context-settings" ? contextSettingsScreen : view.screen === "switch" ? switchScreen : view.screen === "me" ? myProfileScreen : view.screen === "set-talk" ? chatSettingsScreen : view.screen === "set-photo" ? photoSettingsScreen : view.screen === "set-setup" ? setupSettingsScreen : view.screen === "set-manage" ? manageSettingsScreen : view.screen === "set-backup" ? backupSettingsScreen : view.screen === "room" ? roomScreen : view.screen === "profile" ? profileScreen : view.screen === "edit" ? editScreen : view.screen === "group" ? groupScreen : view.screen === "pick" ? pickScreen : view.screen === "terms" ? termsScreen : view.screen === "modules" ? modulesScreen : view.screen === "my-photo" ? myPhotoScreen : view.screen === "settings" ? settingsScreen : view.screen === "style-edit" ? styleEditScreen : view.screen === "bot-apply" ? botApplyScreen : view.screen === "bot-budget" ? botBudgetScreen : view.screen === "debug" ? debugScreen : listScreen;
+		const screen = !state.enabled && !shared.includes(view.screen) ? settingsScreen : view.screen === "context-settings" ? contextSettingsScreen : view.screen === "switch" ? switchScreen : view.screen === "me" ? myProfileScreen : view.screen === "set-talk" ? chatSettingsScreen : view.screen === "set-photo" ? photoSettingsScreen : view.screen === "set-setup" ? setupSettingsScreen : view.screen === "set-manage" ? manageSettingsScreen : view.screen === "set-backup" ? backupSettingsScreen : view.screen === "room" ? roomScreen : view.screen === "profile" ? profileScreen : view.screen === "edit" ? editScreen : view.screen === "group" ? groupScreen : view.screen === "pick" ? pickScreen : view.screen === "reanalyze" ? reanalyzeScreen : view.screen === "terms" ? termsScreen : view.screen === "modules" ? modulesScreen : view.screen === "my-photo" ? myPhotoScreen : view.screen === "settings" ? settingsScreen : view.screen === "style-edit" ? styleEditScreen : view.screen === "bot-apply" ? botApplyScreen : view.screen === "bot-budget" ? botBudgetScreen : view.screen === "debug" ? debugScreen : listScreen;
 		const nodes = screen(state);
 		const kept = live ? keepAround(document.getElementById("win"), nodes, live) : false;
 		if (!kept) document.getElementById("win").replaceChildren(...nodes);
@@ -10853,21 +11076,40 @@ ${log}`;
 		return rules.join("\n");
 	}
 	const STORY_VIEW_CHARS = 2e3;
+	const storyViewJobs = new WeakMap();
+	const storyWriting = new Set();
 	const textSig = (s) => {
 		let h = 5381;
 		for (let i = 0; i < s.length; i++) h = h * 33 + s.charCodeAt(i) | 0;
 		return (h >>> 0).toString(36) + ":" + s.length;
 	};
-	async function storyViews(state, members, story, pcName, report, counterpart = null) {
+	async function storyViews(state, members, story, pcName, report, counterpart = null, onAsk = null) {
 		const sig = textSig(story);
 		const views = state.storyViews && typeof state.storyViews === "object" ? state.storyViews : {};
+		state.storyViews = views;
 		const slot = (m) => counterpart ? `${m.id}>${counterpart.id}` : m.id;
 		const missing = members.filter((m) => views[slot(m)]?.sig !== sig);
 		const other = counterpart ? counterpart.name : pcName;
 		if (missing.length) {
-			const prompt = `아래 [본편 줄거리]는 모든 장면을 보는 서술자의 기록이다. 각 인물이 실제로 알 수 있는 것만 남긴 줄거리를 인물마다 따로 쓴다.
+			onAsk?.();
+			let jobs = storyViewJobs.get(state);
+			if (!jobs) storyViewJobs.set(state, jobs = new Map());
+			const jobKeys = new Map(missing.map((m) => [m, JSON.stringify([
+				story,
+				pcName,
+				counterpart?.id ?? null,
+				other,
+				m.id,
+				m.name,
+				m.aliases || []
+			])]));
+			const jobKey = (m) => jobKeys.get(m);
+			const fresh = missing.filter((m) => !jobs.has(jobKey(m)));
+			if (fresh.length) {
+				const task = (async () => {
+					const prompt = `아래 [본편 줄거리]는 모든 장면을 보는 서술자의 기록이다. 각 인물이 실제로 알 수 있는 것만 남긴 줄거리를 인물마다 따로 쓴다.
 사용자: ${pcName}
-인물: ${missing.map((m) => m.name).join(", ")}
+인물: ${fresh.map((m) => m.name).join(", ")}
 규칙:
 - 그 인물이 그 자리에 있어 직접 보고 들은 일과, 줄거리 안에서 누군가에게 말로 전해 들은 일만 쓴다.
 - 그 인물이 없던 장면, 다른 인물의 속마음, 서술자만 아는 묘사와 설명은 쓰지 않는다.
@@ -10879,20 +11121,30 @@ JSON 하나만 출력한다: {"views":[{"who":"인물 이름","text":"그 인물
 
 [본편 줄거리]
 ${story}`;
-			const raw = parseCard(await askModel([{
-				role: "user",
-				content: prompt
-			}], null, "story-view"));
-			const list = Array.isArray(raw?.views) ? raw.views : [];
-			for (const m of missing) {
-				const hit = list.find((v) => typeof v?.who === "string" && findMember([m], v.who));
-				if (typeof hit?.text !== "string" || !hit.text.trim()) throw new Error(`${m.name}의 인물별 줄거리를 받지 못했습니다`);
-				views[slot(m)] = {
-					sig,
-					text: hit.text.trim().slice(0, STORY_VIEW_CHARS),
-					t: Date.now()
-				};
+					const raw = parseCard(await askModel([{
+						role: "user",
+						content: prompt
+					}], null, "story-view"));
+					const list = Array.isArray(raw?.views) ? raw.views : [];
+					const result = new Map();
+					for (const m of fresh) {
+						const hit = list.find((v) => typeof v?.who === "string" && findMember([m], v.who));
+						if (typeof hit?.text !== "string" || !hit.text.trim()) throw new Error(`${m.name}의 인물별 줄거리를 받지 못했습니다`);
+						result.set(m.id, {
+							sig,
+							text: hit.text.trim().slice(0, STORY_VIEW_CHARS),
+							t: Date.now()
+						});
+					}
+					for (const m of fresh) views[slot(m)] = result.get(m.id);
+					return result;
+				})().finally(() => {
+					for (const m of fresh) if (jobs.get(jobKey(m)) === task) jobs.delete(jobKey(m));
+				});
+				for (const m of fresh) jobs.set(jobKey(m), task);
 			}
+			const results = await Promise.all(missing.map((m) => jobs.get(jobKey(m)).then((result) => [slot(m), result.get(m.id)])));
+			for (const [key, result] of results) views[key] = result;
 			state.storyViews = views;
 		}
 		const text = members.map((m) => `## ${m.name}\n${views[slot(m)].text}`).join("\n\n");
@@ -10944,10 +11196,14 @@ ${story}`;
 		});
 		let storyView = "";
 		if (storyIn && story.trim()) {
+			const writing = ctx.key + "|" + room.id;
 			try {
 				storyView = await storyViews(state, people, story, pcName, report, asUser ? null : {
 					id: actor,
 					name: actorName
+				}, () => {
+					storyWriting.add(writing);
+					render();
 				});
 			} catch (e) {
 				report.push({
@@ -10958,6 +11214,8 @@ ${story}`;
 					truncated: false,
 					error: e.message
 				});
+			} finally {
+				if (storyWriting.delete(writing)) render();
 			}
 		}
 		const useMemory = state.newMemory === true;
