@@ -1,7 +1,7 @@
 //@name interlude
-//@display-name Interlude v1.3.1
+//@display-name Interlude v1.3.2
 //@api 3.0
-//@version 1.3.1
+//@version 1.3.2
 //@update-url https://raw.githubusercontent.com/Nicered/interlude-risu/main/interlude.js
 //@arg model_slot string 쓸 모델. aux는 Risu 보조 모델, main은 Risu 메인 모델입니다.
 //@arg nai_key string NovelAI API 키 (사진 기능). Interlude 설정 → 시작 준비에서 입력합니다.
@@ -179,7 +179,7 @@
 
 //#endregion
 //#region src/core/constants.js
-	const PLUGIN_VERSION = "1.3.1";
+	const PLUGIN_VERSION = "1.3.2";
 	const STORE_PREFIX = "interlude:v1:";
 	const STORY_CHARS = 16e3;
 	const SUMMARY_CHARS = 6e3;
@@ -4931,8 +4931,8 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 
 //#endregion
 //#region src/ui/screens/allowance.js
-	function budgetIntroPanel(state) {
-		if (!state.enabled || view.screen !== "list" || view.chatDelete || memoryIntroPanel(state) || contextBudget(state).mode !== "basic") return null;
+	function budgetIntroPanel(state, combined = false) {
+		if (!state.enabled || !combined && view.screen !== "list" || view.chatDelete || !combined && memoryIntroPanel(state) || contextBudget(state).mode !== "basic" && !(combined && (view.budgetIntro?.error || view.updateSettings?.budgetAttempt))) return null;
 		const pick = view.budgetIntro ||= {
 			mode: "standard",
 			scope: "all",
@@ -4978,7 +4978,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "notice flush",
 			role: "alert",
 			"data-t": "budget-intro-error"
-		}, pick.error) : null, h("div", {
+		}, pick.error) : null, combined ? null : h("div", {
 			class: "actions flush",
 			style: "justify-content:flex-end"
 		}, h("button", {
@@ -4989,12 +4989,12 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		}, pick.saving ? "저장하는 중…" : "적용"))));
 	}
 	async function applyBudgetChoice(key, pick) {
-		if (pick.saving) return;
+		if (pick.saving) return false;
 		const busy = budgetBusy(key);
 		if (busy) {
 			pick.error = busy;
 			render();
-			return;
+			return false;
 		}
 		pick.saving = true;
 		pick.error = "";
@@ -5011,7 +5011,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			pick.saving = false;
 			pick.error = "저장된 채팅 목록을 읽지 못했어요. 다시 눌러 주세요.";
 			render();
-			return;
+			return false;
 		}
 		const chatPrefix = pick.scope === "all" ? STORE_PREFIX : STORE_PREFIX + botId + ":";
 		const chatKeys = [...new Set([...keys.filter((k) => k.startsWith(chatPrefix)), ...[...states.keys()].filter((k) => k.startsWith(chatPrefix))])];
@@ -5021,26 +5021,49 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			try {
 				const loaded = states.get(k), saved = loaded || await readJson(k);
 				if (!saved || typeof saved !== "object" || contextBudget(saved).mode !== "basic") continue;
+				const previousBudget = saved.contextBudget, hadBudget = Object.hasOwn(saved, "contextBudget");
+				const previousMarks = (saved.contacts || []).map((c) => [
+					c,
+					Object.hasOwn(c, "analysisStale"),
+					c.analysisStale
+				]);
 				setChatBudget(saved, next);
-				if (loaded) await saveState(k);
-				else await risuai.pluginStorage.setItem(k, JSON.stringify(saved));
+				try {
+					if (loaded) await saveState(k);
+					else await risuai.pluginStorage.setItem(k, JSON.stringify(saved));
+				} catch (e) {
+					if (hadBudget) saved.contextBudget = previousBudget;
+					else delete saved.contextBudget;
+					for (const [contact, hadMark, mark] of previousMarks) {
+						if (hadMark) contact.analysisStale = mark;
+						else delete contact.analysisStale;
+					}
+					throw e;
+				}
 				changed++;
 			} catch {
 				failed++;
 			}
 		}
-		for (const id of botIds) {
+		if (!failed) for (const id of botIds) {
 			try {
 				const cfg = await loadBotCfg(id);
-				if (cfg.contextBudget.mode === "basic") await saveBotCfg(id, {
-					...cfg,
-					contextBudget: copyValue(next)
-				});
+				if (cfg.contextBudget.mode === "basic") {
+					const updated = {
+						...cfg,
+						contextBudget: copyValue(next)
+					};
+					await risuai.pluginStorage.setItem(BOT_PREFIX + id, JSON.stringify({
+						schema: 1,
+						...updated
+					}));
+					botCfgs.set(id, updated);
+				}
 			} catch {
 				failed++;
 			}
 		}
-		if (pick.scope === "all") {
+		if (!failed && pick.scope === "all") {
 			try {
 				const record = {
 					...await loadBudgetRecord(),
@@ -5056,34 +5079,44 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		if (failed) {
 			pick.error = `${failed}곳에 저장하지 못했어요. 다시 눌러 주세요.`;
 			if (view.key === key) render();
-			return;
+			return false;
 		}
 		view.budgetIntro = null;
 		view.notice = `설정 분량을 ${BUDGET_LABELS[pick.mode]}(으)로 정했어요${changed ? ` · 채팅 ${changed}개` : ""}.` + (pick.mode === "light" ? "" : " 기존 인물은 필요할 때 프로필에서 다시 분석해 주세요.");
 		if (view.key === key) render();
+		return true;
 	}
-	function memoryIntroPanel(state) {
-		if (!state.enabled || view.screen !== "list" || state.memoryIntro || state.newMemory === true || follows(state, "memory") || view.chatDelete) return null;
-		const key = view.key;
-		const answer = async (on) => {
-			if (view.memoryIntroSaving) return;
-			const old = {
-				newMemory: state.newMemory,
-				memoryIntro: state.memoryIntro
-			};
-			view.memoryIntroSaving = true;
-			if (on) state.newMemory = true;
-			state.memoryIntro = on ? "accepted" : "later";
-			try {
-				await saveState(key);
-			} catch {
-				Object.assign(state, old);
-				view.notice = "메모리 설정을 저장하지 못했어요.";
-			} finally {
-				view.memoryIntroSaving = false;
-				if (view.key === key) render();
-			}
+	async function applyMemoryIntroChoice(key, on) {
+		const state = states.get(key);
+		if (!state || view.memoryIntroSaving) return false;
+		const old = {
+			newMemory: state.newMemory,
+			memoryOn: state.memoryOn,
+			memoryIntro: state.memoryIntro
 		};
+		view.memoryIntroSaving = true;
+		view.memoryIntroError = "";
+		if (on) {
+			state.newMemory = true;
+			state.memoryOn = true;
+		}
+		state.memoryIntro = on ? "accepted" : "later";
+		try {
+			await saveState(key);
+			return true;
+		} catch {
+			Object.assign(state, old);
+			view.memoryIntroError = "메모리 설정을 저장하지 못했어요.";
+			return false;
+		} finally {
+			view.memoryIntroSaving = false;
+			if (view.key === key) render();
+		}
+	}
+	function memoryIntroPanel(state, choose = null, selected = null) {
+		if (!state.enabled || !choose && view.screen !== "list" || autoMemoryRecord?.choice || state.memoryIntro || state.newMemory === true || follows(state, "memory") || view.chatDelete) return null;
+		const key = view.key;
+		const answer = (on) => choose ? choose(on) : applyMemoryIntroChoice(key, on);
 		return h("div", {
 			class: "crop-overlay",
 			role: "dialog",
@@ -5094,13 +5127,15 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "actions flush",
 			style: "justify-content:flex-end"
 		}, h("button", {
-			class: "pill",
+			class: "pill" + (selected === false ? " primary" : ""),
 			"data-t": "memory-intro-later",
+			"aria-pressed": selected === false ? "true" : "false",
 			disabled: !!view.memoryIntroSaving,
 			onclick: () => answer(false)
-		}, "나중에"), h("button", {
-			class: "pill primary",
+		}, "기존 설정 유지"), h("button", {
+			class: "pill" + (selected === true ? " primary" : ""),
 			"data-t": "memory-intro-on",
+			"aria-pressed": selected === true ? "true" : "false",
 			disabled: !!view.memoryIntroSaving,
 			onclick: () => answer(true)
 		}, "켜기"))));
@@ -5660,6 +5695,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			state.enabled = value;
 			if (value && !state.memoryIntro && !follows(state, "memory")) {
 				state.newMemory = true;
+				state.memoryOn = true;
 				state.memoryIntro = "enabled";
 			}
 			await saveState(view.key);
@@ -5825,17 +5861,21 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		const cfg = botCfgs.get(botIdOf(key)) || copyValue(BOT_DEFAULTS);
 		const t = bot ? cfg : state;
 		const set = async (field, value) => {
+			const change = field === "newMemory" && value ? {
+				newMemory: true,
+				memoryOn: true
+			} : { [field]: value };
 			if (bot) {
 				try {
 					await saveBotCfg(botIdOf(key), {
 						...cfg,
-						[field]: value
+						...change
 					});
 				} catch {
 					view.notice = "봇 설정을 저장하지 못했어요.";
 				}
 			} else {
-				state[field] = value;
+				Object.assign(state, change);
 				if (field === "newMemory") state.memoryIntro ||= "settings";
 				await saveState(key);
 			}
@@ -5875,10 +5915,10 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				"data-t": "chat-mode-desc"
 			}, MODES[mode].desc)),
 			followCard(state, bot, "link", "본편과 메신저", toggleRow("본편 → 메신저", "본편 줄거리와 본편 메모리를 답장에 씁니다. 끄면 설정, 메모리, 메신저 대화만 봅니다.", t.storyIn !== false, (value) => set("storyIn", value), "story-in"), toggleRow("메신저 → 본편", "메신저 대화와 대화 메모리를 본편 요청에 함께 보냅니다.", t.inject, (value) => set("inject", value), "inject")),
-			followCard(state, bot, "memory", "메모리", toggleRow("새 메모리 사용", "켜면 본편 메모리, 설정 메모리, 대화 메모리를 씁니다. 끄면 1.0.2처럼 본편 요약만 넣고, 저장된 메모리는 지우지 않고 그대로 둡니다.", !!t.newMemory, (value) => set("newMemory", value), "new-memory"), t.newMemory ? toggleRow("본편 메모리 사용", "본편 채팅의 요약에서 이 방 인물이 겪은 일을 가져옵니다. 모델을 따로 부르지 않아요.", t.useSummary, (value) => set("useSummary", value), "summary") : toggleRow("본편 요약 반영", "최근 줄거리 밖의 사건을 본편 채팅의 요약에서 가져와 답장에 씁니다.", t.useSummary, (value) => set("useSummary", value), "summary"), t.newMemory ? h("label", { class: "field flat" }, h("span", { class: "label" }, "가져올 곳"), sourceSelect) : null, t.newMemory && !bot ? h("div", {
+			followCard(state, bot, "memory", "메모리", toggleRow("메모리 사용", "켜면 저장된 기억을 답장에 쓰고, 메신저 대화도 자동으로 정리해 기억합니다. 끄면 본편 요약만 쓰며 저장된 메모리는 유지합니다.", !!t.newMemory, (value) => set("newMemory", value), "new-memory"), t.newMemory ? toggleRow("본편 메모리 사용", "본편 채팅의 요약에서 이 방 인물이 겪은 일을 가져옵니다. 모델을 따로 부르지 않아요.", t.useSummary, (value) => set("useSummary", value), "summary") : toggleRow("본편 요약 반영", "최근 줄거리 밖의 사건을 본편 채팅의 요약에서 가져와 답장에 씁니다.", t.useSummary, (value) => set("useSummary", value), "summary"), t.newMemory ? h("label", { class: "field flat" }, h("span", { class: "label" }, "가져올 곳"), sourceSelect) : null, t.newMemory && !bot ? h("div", {
 				class: "sub",
 				"data-t": "story-memory-status"
-			}, state.storyIn === false ? "본편 → 메신저가 꺼져 있어 쓰지 않아요." : lastText) : null, t.newMemory ? toggleRow("메모리 자동 정리", `한 방에 새 메시지가 ${MEMORY_EVERY}개 쌓이면 답장 뒤에 모델을 한 번 불러 기억할 것을 정리합니다.`, !!t.memoryOn, (value) => set("memoryOn", value), "memory-on") : null),
+			}, state.storyIn === false ? "본편 → 메신저가 꺼져 있어 쓰지 않아요." : lastText) : null, t.newMemory ? h("details", { "data-t": "memory-details" }, h("summary", { class: "sub" }, "세부 설정"), toggleRow("메모리 자동 정리", `한 방에 새 메시지가 ${MEMORY_EVERY}개 쌓이면 답장 뒤에 모델을 한 번 불러 기억할 것을 정리합니다. 끄면 저장된 기억만 사용합니다.`, !!t.memoryOn, (value) => set("memoryOn", value), "memory-on")) : null),
 			timeCard(state, bot, t, set),
 			contextBudgetSection(state, bot),
 			followCard(state, bot, "polish", "캐릭터 계정에서 말투로 다듬기", toggleRow("말투로 다듬기", "켜면 캐릭터 계정에서 보내기를 누를 때 그 캐릭터 말투로 다듬은 문장이 입력창에 들어가요. 확인하거나 고친 뒤 다시 누르면 보내요. 끄면 쓴 그대로 보내고, 캐릭터는 그 말투를 따라 하지 않고 한 일과 약속만 기억해요.", t.polish !== false, (value) => set("polish", value), "polish")),
@@ -6514,6 +6554,228 @@ button.row:hover,.rowmain:hover{background:var(--hover)}
 			selecting: null,
 			r18Error: ""
 		});
+	}
+
+//#endregion
+//#region src/ui/screens/auto-memory.js
+	function autoMemoryIntroPanel(state, choose = null, selected = null) {
+		if (!state.enabled || !autoMemoryRecord || autoMemoryRecord.answered || view.chatDelete) return null;
+		const key = view.key;
+		return h("div", {
+			class: "crop-overlay",
+			role: "dialog",
+			"aria-modal": "true",
+			"aria-label": "메모리 자동 정리 안내",
+			"data-t": "auto-memory-intro"
+		}, h("section", { class: "card dialog-card" }, h("h3", {}, "메모리를 켜면 대화도 자동으로 기억해요"), h("p", { class: "sub" }, "앞으로 메모리를 켜면 대화 자동 정리도 함께 켜집니다. 지금까지 쓰던 채팅에도 적용할 범위를 골라 주세요. 세부 설정에서 자동 정리만 따로 끌 수 있어요."), h("p", { class: "sub" }, `새 메시지가 ${MEMORY_EVERY}개 쌓이면 답장 뒤에 모델을 한 번 더 불러 기억을 정리해요. 지금 선택하는 것만으로는 모델을 부르지 않아요.`), view.autoMemoryError ? h("div", {
+			class: "notice flush",
+			role: "alert",
+			"data-t": "auto-memory-error"
+		}, view.autoMemoryError) : null, h("div", { class: "actions flush" }, ...[
+			["all", "전체 챗에 반영"],
+			["bot", "이 봇에 반영"],
+			["none", "반영 안 함"]
+		].map(([scope, label]) => h("button", {
+			class: "pill" + (selected === scope ? " primary" : ""),
+			"data-t": "auto-memory-" + scope,
+			"aria-pressed": selected === scope ? "true" : "false",
+			disabled: !!view.autoMemorySaving,
+			onclick: () => choose ? choose(scope) : applyAutoMemoryChoice(key, scope)
+		}, label)))));
+	}
+	let pendingRecovery = [];
+	async function recoverChoice(undos) {
+		const failed = [];
+		for (const undo of [...undos].reverse()) {
+			try {
+				await undo();
+			} catch {
+				failed.unshift(undo);
+			}
+		}
+		pendingRecovery = failed;
+		if (failed.length) throw new Error("이전 설정을 모두 복구하지 못했어요. 다시 누르면 복구를 재시도해요.");
+	}
+	async function restoreStored(key, raw) {
+		if (raw === undefined || raw === null) await risuai.pluginStorage.removeItem(key);
+		else await risuai.pluginStorage.setItem(key, raw);
+	}
+	async function applyAutoMemoryChoice(key, scope) {
+		if (view.autoMemorySaving) return false;
+		view.autoMemorySaving = true;
+		view.autoMemoryError = "";
+		render();
+		const undos = [];
+		try {
+			if (pendingRecovery.length) await recoverChoice(pendingRecovery);
+			const record = await loadAutoMemoryRecord();
+			if (!record) throw new Error("메모리 안내 상태를 읽지 못했어요. 다시 눌러 주세요.");
+			if (scope !== "none") {
+				const botId = botIdOf(key), keys = await risuai.pluginStorage.keys() || [];
+				const prefix = scope === "all" ? STORE_PREFIX : STORE_PREFIX + botId + ":";
+				const chatKeys = [...new Set([
+					key,
+					...keys,
+					...states.keys()
+				].filter((k) => k.startsWith(prefix)))];
+				const botIds = new Set([botId, ...chatKeys.map(botIdOf)]);
+				if (scope === "all") {
+					for (const k of keys) if (k.startsWith(BOT_PREFIX)) botIds.add(k.slice(BOT_PREFIX.length));
+					for (const id of botCfgs.keys()) botIds.add(id);
+				}
+				for (const k of chatKeys) {
+					const loaded = states.get(k), raw = loaded ? undefined : await risuai.pluginStorage.getItem(k);
+					const state = loaded || (typeof raw === "string" ? JSON.parse(raw) : raw);
+					if (!state || typeof state !== "object") continue;
+					const previous = {
+						newMemory: state.newMemory,
+						memoryOn: state.memoryOn
+					};
+					const hadMemory = Object.hasOwn(state, "newMemory"), hadAuto = Object.hasOwn(state, "memoryOn");
+					undos.push(async () => {
+						if (loaded) {
+							if (hadMemory) state.newMemory = previous.newMemory;
+							else delete state.newMemory;
+							if (hadAuto) state.memoryOn = previous.memoryOn;
+							else delete state.memoryOn;
+							await saveState(k);
+						} else await restoreStored(k, raw);
+					});
+					state.newMemory = true;
+					state.memoryOn = true;
+					if (loaded) await saveState(k);
+					else await risuai.pluginStorage.setItem(k, JSON.stringify(state));
+				}
+				for (const id of botIds) {
+					const botKey = BOT_PREFIX + id, raw = await risuai.pluginStorage.getItem(botKey), previous = botCfgs.get(id);
+					const cfg = {
+						...await loadBotCfg(id),
+						newMemory: true,
+						memoryOn: true
+					};
+					undos.push(async () => {
+						if (previous) botCfgs.set(id, previous);
+						else botCfgs.delete(id);
+						await restoreStored(botKey, raw);
+					});
+					await risuai.pluginStorage.setItem(BOT_PREFIX + id, JSON.stringify({
+						schema: 1,
+						...cfg
+					}));
+					botCfgs.set(id, cfg);
+				}
+			}
+			await saveAutoMemoryRecord({
+				...record,
+				answered: true,
+				choice: scope
+			});
+			return true;
+		} catch (e) {
+			if (undos.length) {
+				try {
+					await recoverChoice(undos);
+				} catch (recoveryError) {
+					view.autoMemoryError = recoveryError.message;
+					return false;
+				}
+			}
+			view.autoMemoryError = "저장하지 못했어요. 다시 눌러 주세요. " + e.message;
+			return false;
+		} finally {
+			view.autoMemorySaving = false;
+			render();
+		}
+	}
+
+//#endregion
+//#region src/ui/screens/update-settings.js
+	function section(panel) {
+		const contents = [...panel.firstElementChild.childNodes];
+		panel.className = "card";
+		panel.style.cssText = "padding:14px 0;margin:12px 0;border-radius:0";
+		for (const name of [
+			"role",
+			"aria-modal",
+			"aria-label"
+		]) panel.removeAttribute(name);
+		panel.replaceChildren(...contents);
+		return panel;
+	}
+	function updateSettingsPanel(state) {
+		if (!state.enabled || view.chatDelete) return null;
+		let draft = view.updateSettings;
+		if (draft?.key !== view.key) {
+			draft = view.updateSettings = {
+				key: view.key,
+				auto: null,
+				memory: null,
+				saving: false,
+				error: ""
+			};
+			view.budgetIntro = null;
+		}
+		const select = (field) => (value) => {
+			draft[field] = value;
+			draft.error = "";
+			render();
+		};
+		const auto = autoMemoryIntroPanel(state, select("auto"), draft.auto);
+		const memory = auto ? null : memoryIntroPanel(state, select("memory"), draft.memory);
+		const budget = budgetIntroPanel(state, true);
+		if (!auto && !memory && !budget) return null;
+		const incomplete = auto && draft.auto === null || memory && draft.memory === null;
+		const parts = {
+			auto: !!auto,
+			memory: !!memory,
+			budget: budget ? view.budgetIntro : null
+		};
+		return h("div", {
+			class: "crop-overlay",
+			role: "dialog",
+			"aria-modal": "true",
+			"aria-label": "업데이트 후 설정",
+			"data-t": "update-settings"
+		}, h("section", { class: "card dialog-card" }, h("h3", {}, "업데이트 후 설정"), h("p", { class: "sub" }, "아직 선택하지 않은 설정만 모았어요. 항목별 적용 범위를 확인하고 한 번에 저장해 주세요."), h("fieldset", {
+			disabled: draft.saving,
+			style: "border:0;padding:0;margin:0;min-width:0"
+		}, ...[
+			auto,
+			memory,
+			budget
+		].filter(Boolean).map(section)), draft.error ? h("div", {
+			class: "notice flush",
+			role: "alert",
+			"data-t": "update-settings-error"
+		}, draft.error) : null, h("div", {
+			class: "actions flush",
+			style: "justify-content:flex-end;position:sticky;bottom:0;background:var(--bg);padding-top:12px"
+		}, h("button", {
+			class: "pill primary",
+			"data-t": "update-settings-save",
+			disabled: draft.saving || !!incomplete,
+			onclick: () => applyUpdateSettings(draft, parts)
+		}, draft.saving ? "저장하는 중…" : "선택한 설정 저장"))));
+	}
+	async function applyUpdateSettings(draft, parts) {
+		if (draft.saving) return;
+		draft.saving = true;
+		draft.error = "";
+		render();
+		try {
+			if (parts.auto && !await applyAutoMemoryChoice(draft.key, draft.auto)) throw new Error(view.autoMemoryError);
+			if (parts.memory && !await applyMemoryIntroChoice(draft.key, draft.memory)) throw new Error(view.memoryIntroError);
+			if (parts.budget) {
+				draft.budgetAttempt = true;
+				if (!await applyBudgetChoice(draft.key, parts.budget)) throw new Error(parts.budget.error);
+				draft.budgetAttempt = false;
+			}
+		} catch (e) {
+			draft.error = (e.message || "설정을 저장하지 못했어요.") + " 저장되지 않은 항목을 확인하고 다시 눌러 주세요.";
+		} finally {
+			draft.saving = false;
+			if (view.key === draft.key) render();
+		}
 	}
 
 //#endregion
@@ -7385,10 +7647,8 @@ ${desc}`;
 		if (!kept) document.getElementById("win").replaceChildren(...nodes);
 		const deletion = chatDeletionPanel(state);
 		if (deletion) document.getElementById("win").append(deletion);
-		const intro = memoryIntroPanel(state);
-		if (intro) document.getElementById("win").append(intro);
-		const budgetIntro = budgetIntroPanel(state);
-		if (budgetIntro) document.getElementById("win").append(budgetIntro);
+		const updateSettings = updateSettingsPanel(state);
+		if (updateSettings) document.getElementById("win").append(updateSettings);
 		const followAll = followAllPanel(state);
 		if (followAll) document.getElementById("win").append(followAll);
 		if (view.viewer && state.enabled) {
@@ -9302,7 +9562,7 @@ ${lore || "(로어 항목 없음)"}`;
 		newMemory: true,
 		useSummary: true,
 		storySource: "auto",
-		memoryOn: false,
+		memoryOn: true,
 		contextBudget: {
 			mode: "standard",
 			...CONTEXT_PRESETS.standard
@@ -9314,7 +9574,8 @@ ${lore || "(로어 항목 없음)"}`;
 	};
 	const CHAT_DEFAULTS = {
 		...BOT_DEFAULTS,
-		newMemory: false
+		newMemory: false,
+		memoryOn: false
 	};
 	const BOT_FIELD_LABELS = {
 		mode: "흐름",
@@ -9336,6 +9597,34 @@ ${lore || "(로어 항목 없음)"}`;
 	const botIdOf = (key) => key.slice(STORE_PREFIX.length).split(":")[0];
 	const follows = (state, card) => state?.follow?.[card] === true;
 	const chatValue = (state, field) => field === "contextBudget" ? contextBudget(state) : state?.[field] ?? CHAT_DEFAULTS[field];
+	const AUTO_MEMORY_KEY = "interlude:auto-memory:v1";
+	let autoMemoryRecord = null;
+	let autoMemoryRecordLoad = null;
+	function loadAutoMemoryRecord() {
+		return autoMemoryRecordLoad ||= (async () => {
+			const raw = await risuai.pluginStorage.getItem(AUTO_MEMORY_KEY);
+			const saved = typeof raw === "string" ? JSON.parse(raw) : raw;
+			if (saved?.schema === 1 && typeof saved.answered === "boolean" && Array.isArray(saved.legacyBots)) return autoMemoryRecord = saved;
+			const keys = await risuai.pluginStorage.keys() || [];
+			const legacyBots = [...new Set(keys.flatMap((k) => k.startsWith(STORE_PREFIX) ? [botIdOf(k)] : k.startsWith(BOT_PREFIX) ? [k.slice(BOT_PREFIX.length)] : []))];
+			const record = {
+				schema: 1,
+				answered: !legacyBots.length,
+				legacyBots
+			};
+			await risuai.pluginStorage.setItem(AUTO_MEMORY_KEY, JSON.stringify(record));
+			return autoMemoryRecord = record;
+		})().catch((e) => {
+			autoMemoryRecordLoad = null;
+			console.log("[interlude] memory choice load failed: " + e.message);
+			return null;
+		});
+	}
+	async function saveAutoMemoryRecord(record) {
+		await risuai.pluginStorage.setItem(AUTO_MEMORY_KEY, JSON.stringify(record));
+		autoMemoryRecord = record;
+		autoMemoryRecordLoad = Promise.resolve(record);
+	}
 	const BUDGET_KEY = "interlude:budget:v1";
 	let budgetRecordLoad = null;
 	function setBudgetRecordLoad(value) {
@@ -9374,12 +9663,14 @@ ${lore || "(로어 항목 없음)"}`;
 		return record?.legacy ? LEGACY_LIGHT() : copyValue(BOT_DEFAULTS.contextBudget);
 	}
 	async function loadBotCfg(botId) {
+		const memoryRecord = await loadAutoMemoryRecord();
 		if (botCfgs.has(botId)) return botCfgs.get(botId);
 		const saved = await readJson(BOT_PREFIX + botId);
 		const cfg = copyValue(BOT_DEFAULTS);
 		if (saved && typeof saved === "object") {
 			for (const field of Object.keys(BOT_DEFAULTS)) if (saved[field] !== undefined) cfg[field] = copyValue(saved[field]);
 		}
+		if (saved?.memoryOn === undefined && (!memoryRecord || memoryRecord.legacyBots.includes(botId))) cfg.memoryOn = false;
 		if (!saved || typeof saved !== "object" || saved.contextBudget === undefined) cfg.contextBudget = budgetDefault(await loadBudgetRecord());
 		try {
 			cfg.contextBudget = validateContextBudget(cfg.contextBudget);
