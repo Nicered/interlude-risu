@@ -1,7 +1,7 @@
 //@name interlude
-//@display-name Interlude v1.4.0
+//@display-name Interlude v1.4.1
 //@api 3.0
-//@version 1.4.0
+//@version 1.4.1
 //@update-url https://raw.githubusercontent.com/Nicered/interlude-risu/main/interlude.js
 //@arg model_slot string 쓸 모델. aux는 Risu 보조 모델, main은 Risu 메인 모델입니다.
 //@arg nai_key string NovelAI API 키 (사진 기능). Interlude 설정 → 시작 준비에서 입력합니다.
@@ -188,7 +188,7 @@
 
 //#endregion
 //#region src/core/constants.js
-	const PLUGIN_VERSION = "1.4.0";
+	const PLUGIN_VERSION = "1.4.1";
 	const STORE_PREFIX = "interlude:v1:";
 	const STORY_CHARS = 16e3;
 	const SUMMARY_CHARS = 6e3;
@@ -4957,6 +4957,165 @@ ${labeled}`;
 	const roomTitle = (state, room, acct = accountOf()) => room.type === "group" ? room.name : roomPartner(state, room, acct)?.name || room.name;
 
 //#endregion
+//#region src/ui/screens/lore-links.js
+	function openLoreLinks(member, books, { onSave, onAnalyze, onSaved, applyLabel = "연결 저장", tab: startTab = "linked" } = {}) {
+		const key = view.key, primary = findLoreEntry(member, books), primaryRef = primary ? loreEntryRef(primary) : "";
+		const automatic = new Set(findLoreEntries({
+			...member,
+			loreSelection: undefined
+		}, books).map(loreEntryRef));
+		let chosen = new Set(findLoreEntries(member, books).map(loreEntryRef)), manual = Array.isArray(member.loreSelection);
+		let tab = startTab, query = "", shown = 25, busy = false;
+		const mode = h("span", { "data-t": "lore-picker-mode" });
+		const count = h("strong", { "data-t": "lore-picker-count" });
+		const tabs = h("div", {
+			class: "lore-tabs",
+			role: "group",
+			"aria-label": "로어북 목록"
+		});
+		const list = h("div", {
+			class: "lore-list",
+			"data-t": "lore-picker-list"
+		});
+		const footer = h("div", { class: "lore-footer" });
+		const error = h("div", {
+			class: "sub",
+			role: "alert",
+			"data-t": "lore-picker-error"
+		});
+		const dismiss = () => {
+			if (view.loreLinksSheet === sheet) view.loreLinksSheet = null;
+			sheet.remove();
+		};
+		const close = () => {
+			if (!busy) dismiss();
+		};
+		const save = async (analyze) => {
+			if (busy || view.key !== key) return;
+			busy = true;
+			error.textContent = "";
+			draw();
+			try {
+				await onSave(manual ? [...chosen] : undefined, [...automatic]);
+				dismiss();
+				onSaved?.();
+				if (analyze) await onAnalyze?.();
+			} catch (e) {
+				error.textContent = e.message || "연결을 저장하지 못했어요.";
+			} finally {
+				busy = false;
+				if (sheet.isConnected) draw();
+			}
+		};
+		const search = h("input", {
+			type: "search",
+			placeholder: "제목이나 키워드 검색",
+			"aria-label": "로어북 검색",
+			"data-t": "lore-picker-search",
+			oninput: (e) => {
+				query = normalize(e.target.value);
+				shown = 25;
+				draw();
+			}
+		});
+		const reset = h("button", {
+			class: "pill",
+			"data-t": "lore-picker-auto",
+			onclick: () => {
+				manual = false;
+				chosen = new Set(automatic);
+				draw();
+			}
+		}, "자동 연결로 되돌리기");
+		const cancel = h("button", {
+			class: "pill",
+			"data-t": "lore-picker-cancel",
+			onclick: close
+		}, "취소");
+		const sheet = h("div", {
+			class: "crop-overlay",
+			"data-t": "lore-picker"
+		}, h("section", {
+			class: "lore-panel",
+			role: "dialog",
+			"aria-modal": "true",
+			"aria-label": `${member.name} 로어북 연결`
+		}, h("div", { class: "lore-heading" }, h("div", {}, h("h2", {}, "로어북 연결"), h("div", { class: "sub" }, member.name)), cancel), h("div", { class: "lore-controls" }, search, h("div", { class: "lore-mode" }, mode, reset), tabs), list, footer));
+		function draw() {
+			mode.textContent = manual ? "직접 선택" : "이름으로 자동 연결";
+			reset.disabled = busy || !manual;
+			cancel.disabled = busy;
+			search.disabled = busy;
+			const linked = books.filter((e) => chosen.has(loreEntryRef(e))), recommended = books.filter((e) => automatic.has(loreEntryRef(e)) && !chosen.has(loreEntryRef(e)));
+			tabs.replaceChildren(...[
+				["linked", `연결됨 ${linked.length}`],
+				["suggested", `추천 ${recommended.length}`],
+				["all", `전체 ${books.length}`]
+			].map(([id, title]) => h("button", {
+				class: "pill" + (tab === id ? " primary" : ""),
+				"aria-pressed": String(tab === id),
+				"data-t": "lore-picker-tab",
+				"data-tab": id,
+				disabled: busy,
+				onclick: () => {
+					tab = id;
+					shown = 25;
+					draw();
+				}
+			}, title)));
+			const source = query ? books : tab === "linked" ? linked : tab === "suggested" ? recommended : books;
+			const matches = source.filter((e) => !query || normalize(loreTitle(e) + " " + String(e.key || "")).includes(query));
+			list.replaceChildren(h("div", { class: "sub lore-result" }, query ? `검색 결과 ${matches.length}개` : `${matches.length}개 항목`), ...matches.slice(0, shown).map((e) => {
+				const ref = loreEntryRef(e), fixed = ref === primaryRef, checked = chosen.has(ref);
+				return h("div", { class: "lore-item" }, h("label", { class: "lore-check" }, h("input", {
+					type: "checkbox",
+					checked,
+					disabled: busy || fixed,
+					"aria-label": `${loreTitle(e)} 연결`,
+					"data-t": "lore-picker-check",
+					"data-ref": ref,
+					onchange: (event) => {
+						manual = true;
+						if (event.target.checked) chosen.add(ref);
+						else chosen.delete(ref);
+						draw();
+					}
+				}), h("span", { class: "lore-item-text" }, h("strong", {}, loreTitle(e)), h("span", { class: "sub" }, fixed ? "대표 항목 · 항상 연결" : String(e.key || "").slice(0, 100) || "키워드 없음"))), h("details", { class: "lore-preview" }, h("summary", {}, "내용 미리보기"), h("p", {}, cleanStory(String(e.content || "")).slice(0, 400) || "본문이 비어 있어요.")));
+			}), !matches.length ? h("p", { class: "sub lore-empty" }, query ? "검색 결과가 없어요. 다른 제목이나 키워드를 입력해 주세요." : tab === "suggested" ? "추가 추천이 없어요. 전체 목록이나 검색에서 직접 고를 수 있어요." : "연결된 항목이 없어요. 전체 목록에서 골라 주세요.") : null, matches.length > shown ? h("button", {
+				class: "pill",
+				"data-t": "lore-picker-more",
+				disabled: busy,
+				onclick: () => {
+					shown += 25;
+					draw();
+				}
+			}, `더 보기 (${Math.min(shown, matches.length)}/${matches.length})`) : null);
+			count.textContent = `연결 ${chosen.size}개`;
+			footer.replaceChildren(count, h("div", { class: "sub" }, primaryRef ? "대표 항목을 포함해 선택한 항목을 함께 사용해요." : "선택한 항목을 함께 사용해요."), error, onAnalyze ? h("div", { class: "sub" }, "다시 분석은 모델을 호출해요. 사진 기능이 켜져 있으면 사진 태그도 갱신해요.") : null, h("div", { class: "lore-buttons" }, h("button", {
+				class: "pill" + (onAnalyze ? "" : " primary"),
+				"data-t": "lore-picker-save",
+				disabled: busy,
+				onclick: () => save(false)
+			}, busy ? "저장 중…" : applyLabel), onAnalyze ? h("button", {
+				class: "pill primary",
+				"data-t": "lore-picker-analyze",
+				disabled: busy,
+				onclick: () => save(true)
+			}, "저장하고 다시 분석") : null));
+		}
+		view.loreLinksSheet?.remove();
+		Object.assign(view, {
+			loreLinksSheet: sheet,
+			loreLinksKey: key,
+			loreLinksScreen: view.screen,
+			loreLinksContactId: member.id
+		});
+		draw();
+		document.getElementById("win").append(sheet);
+		return sheet;
+	}
+
+//#endregion
 //#region src/ui/screens/edit.js
 	async function openEdit(contactId) {
 		if (!view.assets) await gatherAssets(view.ctx);
@@ -5117,17 +5276,22 @@ ${labeled}`;
 	function editScreen(state) {
 		const editKey = view.key;
 		const existing = state.contacts.find((c) => c.id === view.contactId);
-		const draft = existing ? { ...existing } : {
-			id: newId(),
-			name: "",
-			bio: "",
-			role: "",
-			aliases: [],
-			asset: "",
-			lore: "",
-			image: "",
-			manualImage: false
+		const draftKey = editKey + "|" + (existing?.id || "new");
+		if (view.editDraft?.key !== draftKey) view.editDraft = {
+			key: draftKey,
+			value: existing ? { ...existing } : {
+				id: newId(),
+				name: "",
+				bio: "",
+				role: "",
+				aliases: [],
+				asset: "",
+				lore: "",
+				image: "",
+				manualImage: false
+			}
 		};
+		const draft = view.editDraft.value;
 		const text = (label, value, testId, placeholder) => h("label", { class: "field" }, h("span", { class: "label" }, label), h("input", {
 			type: "text",
 			value,
@@ -5271,25 +5435,35 @@ ${labeled}`;
 			if (!existing) analyzeInBackground(state, [draft]);
 		};
 		const books = view.editLoreBooks || [];
-		const linked = new Set(findLoreEntries(draft, books).map(loreEntryRef));
-		const primary = findLoreEntry(draft, books);
-		const loreSelect = h("select", {
-			multiple: true,
-			size: Math.min(6, Math.max(2, books.length)),
-			"data-t": "contact-lore-selection",
-			"aria-label": "연결할 로어북 항목",
-			onchange: (e) => {
-				draft.loreSelection = [...e.target.selectedOptions].map((o) => o.value);
-			}
-		}, books.map((entry) => h("option", {
-			value: loreEntryRef(entry),
-			selected: linked.has(loreEntryRef(entry)),
-			disabled: entry === primary
-		}, `${loreTitle(entry)}${entry === primary ? " (대표 항목)" : ""}`)));
-		const loreConnections = books.length ? h("details", {
+		const loreSummary = h("div", {
+			class: "sub",
+			"data-t": "contact-lore-summary"
+		});
+		const updateLoreSummary = () => {
+			const linked = findLoreEntries(draft, books);
+			loreSummary.textContent = `연결 ${linked.length}개 · ${linked.map(loreTitle).join(" / ")}`;
+		};
+		updateLoreSummary();
+		const loreConnections = books.length ? h("section", {
 			class: "field",
 			"data-t": "contact-lore-links"
-		}, h("summary", {}, `연결된 로어북 ${linked.size}개`), h("div", { class: "sub" }, "같은 인물의 여러 항목을 함께 분석해요. 대표 항목은 유지하고 추가로 사용할 항목을 고를 수 있어요. 변경 후 다시 분석하면 반영돼요."), loreSelect) : null;
+		}, h("h3", {}, "로어북 연결"), loreSummary, h("button", {
+			class: "pill top-gap",
+			"data-t": "contact-lore-open",
+			onclick: () => openLoreLinks(draft, books, {
+				applyLabel: "선택 적용",
+				onSave: async (selection, seen) => {
+					if (selection) {
+						draft.loreSelection = selection;
+						draft.loreSeen = seen;
+					} else {
+						delete draft.loreSelection;
+						delete draft.loreSeen;
+					}
+					updateLoreSummary();
+				}
+			})
+		}, "연결 변경"), h("div", { class: "sub top-gap" }, "선택을 적용한 뒤 프로필을 저장해 주세요. 기존 인물은 다시 분석하면 분석본에 반영돼요.")) : null;
 		return [h("div", { class: "top line-b" }, backBtn(leave), h("h1", { class: "small" }, existing ? "프로필 수정" : "이름으로 분석"), closeBtn()), h("div", {
 			class: "scroll",
 			id: "scroll"
@@ -5513,7 +5687,9 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 		if (!view.assets) await gatherAssets(view.ctx);
 		const state = states.get(view.key), contact = state.contacts.find((c) => c.id === contactId);
 		view.cardStale = false;
-		if (contact?.card && contact.loreHash) view.cardStale = loreHash(await memberCardText(contact, await loreBooks(), contextBudget(state).analysis)) !== contact.loreHash;
+		view.profileLoreBooks = await loreBooks();
+		view.profileLoreKey = view.key;
+		if (contact?.card && contact.loreHash) view.cardStale = loreHash(await memberCardText(contact, view.profileLoreBooks, contextBudget(state).analysis)) !== contact.loreHash;
 		go("profile", {
 			contactId,
 			profileFrom: view.screen === "profile" ? view.profileFrom : view.screen === "edit" ? view.profileFrom : view.screen
@@ -5648,7 +5824,7 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 			class: "act2",
 			"data-t": "profile-photo",
 			onclick: () => openEdit(c.id)
-		}, h("span", { class: "round" }, icon("camera")), "사진 변경")), h("section", { class: "card" }, h("h3", {}, "소개"), h("div", { class: "fact" }, icon("book"), h("span", {}, present ? "최근 대화에서 이름을 확인했어요." : "최근 대화에서 이름을 확인하지 못했어요.")), c.lore ? h("div", { class: "fact" }, icon("spark"), h("span", {}, `로어북 항목 "${c.lore}"`)) : null), analysisSection(state, c), memorySection(state, c), imageTagSection(state, c), photoReferenceSection(state, c), photoCard, groups.length ? h("section", { class: "card" }, h("h3", {}, "함께 있는 단톡방"), groups.map((r) => h("button", {
+		}, h("span", { class: "round" }, icon("camera")), "사진 변경")), h("section", { class: "card" }, h("h3", {}, "소개"), h("div", { class: "fact" }, icon("book"), h("span", {}, present ? "최근 대화에서 이름을 확인했어요." : "최근 대화에서 이름을 확인하지 못했어요.")), c.lore ? h("div", { class: "fact" }, icon("spark"), h("span", {}, `로어북 항목 "${c.lore}"`)) : null), loreLinksSection(state, c), analysisSection(state, c), memorySection(state, c), imageTagSection(state, c), photoReferenceSection(state, c), photoCard, groups.length ? h("section", { class: "card" }, h("h3", {}, "함께 있는 단톡방"), groups.map((r) => h("button", {
 			class: "row flat",
 			onclick: () => openRoom(r)
 		}, roomAvatar(state, r, 40), h("span", { class: "mid" }, h("span", { class: "nm" }, r.name), h("span", { class: "pv" }, h("span", { class: "tx" }, `${r.members.length + 1}명`)))))) : null, h("section", { class: "card" }, h("h3", {}, "채팅 설정"), toggleRow("이 대화를 본편에 반영", "이 사람과 나눈 대화를 본편 요청에 함께 보냅니다.", inject, async (on) => {
@@ -5659,6 +5835,74 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 			"data-t": "room-export",
 			onclick: () => downloadJson(`interlude-${c.name}.json`, makeBackup(view.ctx, state, room))
 		}, h("span", { class: "mid" }, "대화 내보내기", h("small", {}, `메시지 ${room.msgs.length}개`))) : null, confirmButton("목록에서 삭제", () => removeContact(state, c), "contact-delete")))];
+	}
+	function loreLinksSection(state, c) {
+		const books = view.profileLoreKey === view.key ? view.profileLoreBooks || [] : [], linked = findLoreEntries(c, books), key = view.key;
+		const unseen = Array.isArray(c.loreSelection) ? findLoreEntries({
+			...c,
+			loreSelection: undefined
+		}, books).filter((e) => {
+			const r = loreEntryRef(e);
+			return !c.loreSelection.includes(r) && !(c.loreSeen || []).includes(r);
+		}) : [];
+		const open = (tab) => async () => {
+			const available = view.profileLoreKey === key ? books : await loreBooks();
+			if (view.key !== key) return;
+			openLoreLinks(c, available, {
+				tab,
+				onSave: async (selection, seen) => {
+					const old = c.loreSelection, oldSeen = c.loreSeen, stale = c.analysisStale, cardStale = view.cardStale;
+					const before = findLoreEntries(c, available).map(loreEntryRef).sort().join("\n");
+					if (selection) {
+						c.loreSelection = selection;
+						c.loreSeen = seen;
+					} else {
+						delete c.loreSelection;
+						delete c.loreSeen;
+					}
+					if (before !== findLoreEntries(c, available).map(loreEntryRef).sort().join("\n")) {
+						c.analysisStale = !!c.card;
+						view.cardStale = !!c.card;
+					}
+					try {
+						await saveState(key);
+					} catch (e) {
+						if (old === undefined) delete c.loreSelection;
+						else c.loreSelection = old;
+						if (oldSeen === undefined) delete c.loreSeen;
+						else c.loreSeen = oldSeen;
+						c.analysisStale = stale;
+						view.cardStale = cardStale;
+						throw e;
+					}
+				},
+				onSaved: render,
+				onAnalyze: async () => {
+					await analyzeInBackground(state, [c], true);
+					if (view.key === key) {
+						view.cardStale = !!c.analysisStale;
+						render();
+					}
+				}
+			});
+		};
+		return h("section", {
+			class: "card",
+			"data-t": "profile-lore-links"
+		}, h("h3", {}, "로어북 연결", h("small", {}, `${linked.length}개`)), h("div", { class: "sub" }, linked.map(loreTitle).join(" / ") || "연결된 항목이 없어요."), unseen.length ? h("div", {
+			class: "notice flush",
+			"data-t": "profile-lore-new"
+		}, h("div", {}, `같은 인물로 보이는 항목 ${unseen.length}개가 아직 연결되지 않았어요: ${unseen.map(loreTitle).join(" / ")}`), h("button", {
+			class: "pill top-gap",
+			"data-t": "profile-lore-new-open",
+			disabled: !!view.analysis,
+			onclick: open("suggested")
+		}, "확인하기")) : null, h("button", {
+			class: "pill top-gap",
+			"data-t": "profile-lore-open",
+			disabled: !!view.analysis,
+			onclick: open("linked")
+		}, "연결 확인·변경"));
 	}
 	function analysisSection(state, c) {
 		const card = c.card;
@@ -5686,7 +5930,10 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 		return h("section", {
 			class: "card",
 			"data-t": "analysis-card"
-		}, h("div", { class: "actions flush" }, again("다시 분석하기")), c.analysisSources?.length ? h("div", {
+		}, h("div", { class: "actions flush" }, again("다시 분석하기")), view.cardStale || c.analysisStale ? h("div", {
+			class: "notice flush",
+			"data-t": "card-stale"
+		}, "로어북이 바뀌었어요. 다시 분석하면 반영돼요. 다시 분석하기 전까지 답장에는 연결된 로어 원문을 나눠서 씁니다.") : null, c.analysisSources?.length ? h("div", {
 			class: "sub",
 			"data-t": "analysis-lore-sources"
 		}, `연결된 로어북 ${c.analysisSources.length}개: ${c.analysisSources.map((s) => s.title).join(" / ")}`) : null, c.contextUsage?.length ? h("pre", {
@@ -5698,10 +5945,7 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 		}, "상세"), c.cardSchema === 2 ? h("div", { class: "sub" }, "같은 봇의 다른 챗에서도 이 분석을 재사용합니다. 호칭과 내 메모는 이 챗에만 적용돼요.") : null, c.cardSchema !== 2 ? h("div", {
 			class: "notice flush",
 			"data-t": "card-legacy"
-		}, "이전 분석본입니다. 답장에는 로어 원문을 사용해요. 다시 분석하면 대상별 호칭과 원문 근거를 확인합니다.") : null, view.cardStale ? h("div", {
-			class: "notice flush",
-			"data-t": "card-stale"
-		}, "로어북이 바뀌었어요. 다시 분석하면 반영돼요.") : null, fact("정체", card["정체"]), fact("소속", card["소속"]), fact("직책", card["직책"]), fact("1인칭", card["1인칭"]), fact("말투", card["말투"]), fact("설정상 관계", card["관계"]), !card["정체"] && c.role ? fact("설명", c.role) : null, c.cardSchema === 2 ? fact("대상별 호칭", (card["호칭관계"] || []).map((r) => `${r["대상"]} → ${r["호칭"]}`)) : fact("이전 호칭 (미적용)", card["상대호칭"]), c.cardSchema === 2 ? h("details", {}, h("summary", {}, "원문 근거 보기"), Object.entries(card["근거"] || {}).map(([label, quote]) => fact(label, quote))) : null, c.cardNote ? fact("내 메모", c.cardNote) : null));
+		}, "이전 분석본입니다. 답장에는 로어 원문을 사용해요. 다시 분석하면 대상별 호칭과 원문 근거를 확인합니다.") : null, fact("정체", card["정체"]), fact("소속", card["소속"]), fact("직책", card["직책"]), fact("1인칭", card["1인칭"]), fact("말투", card["말투"]), fact("설정상 관계", card["관계"]), !card["정체"] && c.role ? fact("설명", c.role) : null, c.cardSchema === 2 ? fact("대상별 호칭", (card["호칭관계"] || []).map((r) => `${r["대상"]} → ${r["호칭"]}`)) : fact("이전 호칭 (미적용)", card["상대호칭"]), c.cardSchema === 2 ? h("details", {}, h("summary", {}, "원문 근거 보기"), Object.entries(card["근거"] || {}).map(([label, quote]) => fact(label, quote))) : null, c.cardNote ? fact("내 메모", c.cardNote) : null));
 	}
 	function trainedLabel(count) {
 		return count >= 5e3 ? "많이 학습됨" : count >= 1e3 ? "학습됨" : "적게 학습됨 · 덜 닮을 수 있어요";
@@ -8176,6 +8420,7 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 //#endregion
 //#region src/ui/styles.js
 	const CSS = `
+.lore-panel{display:flex;flex-direction:column;width:min(100%,560px);max-height:92vh;background:var(--bg);color:var(--text);border-radius:16px;overflow:hidden;box-shadow:var(--shadow)}.lore-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:18px 18px 12px}.lore-heading h2{font-size:19px;margin:0 0 4px}.lore-controls{padding:0 18px 12px;border-bottom:1px solid var(--line)}.lore-controls>input{width:100%;padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:10px;font-size:16px}.lore-mode{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:10px 0;font-size:12px;color:var(--sub)}.lore-tabs{display:flex;gap:6px;flex-wrap:wrap}.lore-list{overflow:auto;min-height:100px;padding:4px 18px 14px}.lore-result{padding:8px 0}.lore-item{padding:10px 0;border-bottom:1px solid var(--line)}.lore-check{display:flex;align-items:flex-start;gap:12px;min-height:44px;cursor:pointer}.lore-check>input{flex:none;width:20px;height:20px;margin:4px 0}.lore-item-text{display:flex;flex-direction:column;gap:5px;min-width:0;overflow-wrap:anywhere}.lore-item-text>strong{font-size:14px}.lore-preview{margin:2px 0 0 32px;font-size:12px;color:var(--sub)}.lore-preview summary{cursor:pointer}.lore-preview p{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}.lore-empty{padding:14px 0}.lore-footer{padding:14px 18px 18px;border-top:1px solid var(--line);background:var(--bg)}.lore-footer>.sub{margin-top:6px;line-height:1.5}.lore-buttons{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:12px}
 .backlog-dialog{width:min(100%,440px)}.backlog-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.backlog-heading h2{margin:0}.backlog-dialog>.backlog-card{border-top:0;padding:0}.backlog-overview{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:14px 0 8px}.backlog-cost{background:var(--bg2);border-radius:10px;padding:12px;margin-top:12px}.backlog-cost strong{display:block;font-size:14px;margin-bottom:6px}.backlog-cost .sub+.sub{margin-top:6px}.backlog-card>.sub{line-height:1.5}.backlog-card .actions.flush{padding-top:12px}
 .crop-overlay{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:12px}
 .card.dialog-card{width:100%;max-width:420px;max-height:85vh;overflow:auto;background:var(--bg);color:var(--text);border-top:0;border-radius:16px;padding:18px;box-shadow:var(--shadow)}.check-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;cursor:pointer}.check-row input{flex:none;width:18px;height:18px;margin:2px 0 0}
@@ -9914,6 +10159,12 @@ ${desc}`;
 		if (updateSettings) document.getElementById("win").append(updateSettings);
 		const followAll = followAllPanel(state);
 		if (followAll) document.getElementById("win").append(followAll);
+		if (view.loreLinksSheet) {
+			if (view.loreLinksKey !== view.key || view.loreLinksScreen !== view.screen || view.loreLinksContactId !== view.contactId) {
+				view.loreLinksSheet.remove();
+				view.loreLinksSheet = null;
+			} else if (!deletion && !updateSettings && !followAll) document.getElementById("win").append(view.loreLinksSheet);
+		}
 		document.querySelector("[data-t=\"story-backlog-notice\"]")?.remove();
 		document.querySelector("[data-t=\"story-backlog-dialog\"]")?.remove();
 		if (!deletion && !updateSettings && !followAll) {
@@ -10207,7 +10458,7 @@ ${words}`
 			const parts = await memberLoreParts(member, books), source = parts.join("\n\n");
 			const lore = cardLore(member, parts, budget.analysis);
 			const note = member.cardNote ? `\n사용자 메모(가장 우선): ${member.cardNote}` : "";
-			let text;
+			let text, full = null;
 			const verified = member.card && member.cardSchema === 2 && (member.analysisLore ? member.analysisLore === lore : member.loreHash === loreHash(lore)) ? verifiedSharedCard(member.card, lore) : null;
 			if (verified) {
 				const extra = relevantLines(lore, lastText, room?.r18 === true);
@@ -10216,9 +10467,19 @@ ${words}`
 					card: verified
 				}) + note + (extra ? `\n관련 설정:\n${spell(extra)}` : "");
 			} else {
-				text = source + note;
+				const cap = Math.min(budget.replyMember, left);
+				full = source.length + note.length;
+				text = (replyLore(parts, cap - note.length) + note).slice(0, Math.max(0, cap));
+				report.push({
+					section: "member",
+					memberId: member.id,
+					sourceChars: full,
+					usedChars: text.length,
+					limit: Math.max(0, cap),
+					truncated: text.length < full
+				});
 			}
-			text = budgetText(text, Math.min(budget.replyMember, left), "member", report, member.id);
+			if (full === null) text = budgetText(text, Math.min(budget.replyMember, left), "member", report, member.id);
 			if (!text) continue;
 			left -= text.length;
 			blocks.push(`## ${member.name}\n${text}`);
@@ -10290,6 +10551,7 @@ ${words}`
 		});
 		return parts.map((p, i) => cut(p, share[i])).filter(Boolean).join("\n\n");
 	}
+	const replyLore = (parts, limit) => balancedLore(parts, Math.max(0, limit), (text, n) => text.slice(0, n));
 	async function memberLoreText(member, books, limit = LORE_PER_MEMBER, report) {
 		const parts = await memberLoreParts(member, books), source = parts.join("\n\n"), cap = Math.max(0, limit);
 		const used = balancedLore(parts, cap, (text, n) => text.slice(0, n));
@@ -13008,6 +13270,7 @@ ${text}`;
 	const go = (screen, extra) => {
 		view.cancelCrop?.();
 		if (screen === "pick") view.noticePick = false;
+		if (screen === "edit" && (view.screen !== "edit" || extra?.contactId !== view.contactId)) view.editDraft = null;
 		Object.assign(view, {
 			screen,
 			viewer: null
@@ -13205,11 +13468,19 @@ ${text}`;
 				keys: strings(raw.keys, 120)
 			};
 			if (raw.loreId !== undefined) c.loreId = text(raw.loreId, 200);
-			for (const field of ["loreIds", "loreSelection"]) if (Array.isArray(raw[field])) c[field] = raw[field].map((value) => text(value, 2e3, true));
+			for (const field of [
+				"loreIds",
+				"loreSelection",
+				"loreSeen"
+			]) if (Array.isArray(raw[field])) c[field] = raw[field].map((value) => text(value, 2e3, true));
 			const known = contacts.find((x) => resolvedPersonKey(x, [...contacts, ...data.contacts]) === resolvedPersonKey(c, [...contacts, ...data.contacts]));
 			if (known) {
 				mergeMemory(known, takeMemory(raw.memory));
-				for (const field of ["loreIds", "loreSelection"]) if (c[field] && !known[field]) known[field] = c[field];
+				for (const field of [
+					"loreIds",
+					"loreSelection",
+					"loreSeen"
+				]) if (c[field] && !known[field]) known[field] = c[field];
 				idMap.set(originalId, known.id);
 				continue;
 			}
