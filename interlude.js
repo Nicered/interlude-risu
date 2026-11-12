@@ -1,7 +1,7 @@
 //@name interlude
-//@display-name Interlude v1.3.2
+//@display-name Interlude v1.4.0
 //@api 3.0
-//@version 1.3.2
+//@version 1.4.0
 //@update-url https://raw.githubusercontent.com/Nicered/interlude-risu/main/interlude.js
 //@arg model_slot string 쓸 모델. aux는 Risu 보조 모델, main은 Risu 메인 모델입니다.
 //@arg nai_key string NovelAI API 키 (사진 기능). Interlude 설정 → 시작 준비에서 입력합니다.
@@ -15,7 +15,8 @@
 			persona: 3e3,
 			replyMember: 5e3,
 			replyTotal: 12e3,
-			roomHistory: 8e3
+			roomHistory: 8e3,
+			memory: 5e3
 		},
 		standard: {
 			analysis: 2e4,
@@ -23,7 +24,8 @@
 			persona: 6e3,
 			replyMember: 12e3,
 			replyTotal: 48e3,
-			roomHistory: 24e3
+			roomHistory: 24e3,
+			memory: 1e4
 		},
 		large: {
 			analysis: 4e4,
@@ -31,7 +33,8 @@
 			persona: 12e3,
 			replyMember: 24e3,
 			replyTotal: 96e3,
-			roomHistory: 48e3
+			roomHistory: 48e3,
+			memory: 2e4
 		}
 	};
 	const BUDGET_LABELS = {
@@ -87,6 +90,12 @@
 			"답장에 넣을 메신저 기록",
 			1e3,
 			1e5
+		],
+		[
+			"memory",
+			"답장에 넣을 기억",
+			1e3,
+			1e5
 		]
 	];
 	const MODES = {
@@ -123,13 +132,13 @@
 		};
 		if (mode !== "custom") throw new Error("설정 분량 모드를 확인해 주세요.");
 		const preset = CONTEXT_PRESETS[input?.preset];
-		if (Object.hasOwn(CONTEXT_PRESETS, input?.preset || "") && Object.keys(preset).every((k) => Number(input[k]) === preset[k])) return {
+		if (Object.hasOwn(CONTEXT_PRESETS, input?.preset || "") && Object.keys(preset).every((k) => k === "memory" && input[k] === undefined || Number(input[k]) === preset[k])) return {
 			mode: input.preset,
 			...preset
 		};
 		const result = { mode };
 		for (const [key, label, min, max] of CONTEXT_FIELDS) {
-			const value = Number(key === "roomHistory" ? input[key] ?? CONTEXT_PRESETS.light.roomHistory : input[key]);
+			const value = Number(key === "roomHistory" || key === "memory" ? input[key] ?? CONTEXT_PRESETS.light[key] : input[key]);
 			if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${label}은 ${min.toLocaleString()}~${max.toLocaleString()}자의 정수로 입력해 주세요.`);
 			result[key] = value;
 		}
@@ -179,7 +188,7 @@
 
 //#endregion
 //#region src/core/constants.js
-	const PLUGIN_VERSION = "1.3.2";
+	const PLUGIN_VERSION = "1.4.0";
 	const STORE_PREFIX = "interlude:v1:";
 	const STORY_CHARS = 16e3;
 	const SUMMARY_CHARS = 6e3;
@@ -204,7 +213,6 @@
 	const SCAN_BATCH = 120;
 	const TERM_BATCH = 150;
 	const RELEVANT_LORE = 600;
-	const ANALYSIS_TOKENS = 2e3;
 	const CONFIRM_FROM = 20;
 	const AUTO_RESCAN_AFTER = 10;
 	const OPENING_CHARS = 4e3;
@@ -212,6 +220,12 @@
 	const UI_SETTINGS = "interlude:ui:v1";
 	const IMAGE_TAGS_PREFIX = "interlude:imagetags:v1:";
 	const PHOTO_PREFIX = "interlude:photo:v1:";
+	const PROFILE_IMAGE_PREFIX = "interlude:profileimg:v1:";
+	const PROFILE_REF = "interlude-profile:";
+	const SHARED_PROFILE_PREFIX = "interlude:profile:v1:";
+	const PROFILE_BG_PREFIX = "interlude:profilebg:v1:";
+	const PROFILE_INDEX_PREFIX = "interlude:profileimg:index:v1:";
+	const PROFILE_THUMB_PREFIX = "interlude:profileimg:thumb:v1:";
 	const THUMB_WIDTH = 360;
 	const THUMB_CACHE = 300;
 	const NAI_ENDPOINT = "https://image.novelai.net/ai/generate-image";
@@ -493,6 +507,62 @@
 	}
 
 //#endregion
+//#region src/people/who.js
+	const namesOf = (c) => [...new Set([
+		c.name,
+		...c.aliases || [],
+		...(c.keys || []).filter((k) => !String(k).trim().startsWith("/")),
+		c.card?.["이름"]
+	].filter((n) => typeof n === "string").map(normalize).filter((n) => n.length >= 2))];
+	function makeResolver(people) {
+		const owners = new Map(), names = new Map();
+		for (const c of people) {
+			if (!c?.id) continue;
+			const list = namesOf(c);
+			names.set(c.id, list);
+			for (const n of list) {
+				if (!owners.has(n)) owners.set(n, new Set());
+				owners.get(n).add(c.id);
+			}
+		}
+		const folderOf = new Map(people.filter((c) => c?.id && c.loreFolder).map((c) => [c.id, c.loreFolder]));
+		const only = (name) => {
+			const ids = owners.get(normalize(name));
+			return ids?.size === 1 ? [...ids][0] : null;
+		};
+		const cache = new Map();
+		const resolve = (name, others = [], text = null) => {
+			const n = normalize(name);
+			const ids = owners.get(n);
+			if (!ids) return null;
+			if (ids.size === 1) return [...ids][0];
+			const candidates = [...ids];
+			const key = n + "\n" + others.map(normalize).sort().join(",");
+			if (!cache.has(key)) {
+				const nearFolders = new Set(others.filter((o) => normalize(o) !== n).map(only).filter(Boolean).map((id) => folderOf.get(id)).filter(Boolean));
+				const inFolder = nearFolders.size ? candidates.filter((id) => nearFolders.has(folderOf.get(id))) : [];
+				cache.set(key, inFolder.length === 1 ? inFolder[0] : null);
+			}
+			const byFolder = cache.get(key);
+			if (byFolder || !text) return byFolder;
+			const body = normalize(text());
+			const hits = candidates.filter((id) => (names.get(id) || []).some((x) => x !== n && owners.get(x)?.size === 1 && body.includes(x)));
+			return hits.length === 1 ? hits[0] : null;
+		};
+		resolve.owned = (name) => owners.has(normalize(name));
+		return resolve;
+	}
+	function namePeople(contacts, candidates, keyOf) {
+		const seen = new Set((contacts || []).map(keyOf));
+		return [...contacts || [], ...(candidates || []).filter((c) => {
+			const k = keyOf(c);
+			if (seen.has(k)) return false;
+			seen.add(k);
+			return true;
+		})];
+	}
+
+//#endregion
 //#region src/core/text.js
 	function cleanStory(text) {
 		return String(text || "").replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "").replace(/```[\s\S]*?```/g, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<[^>\n]{1,300}>/g, "").replace(/\{\{[^{}]*\}\}/g, "").replace(/\n{3,}/g, "\n\n").trim();
@@ -525,6 +595,7 @@
 			ids: win.ids
 		};
 	}
+	const summaryText = (chunk) => typeof chunk.summarized === "string" && chunk.summarized.trim() && !/^[a-z_]+$/.test(chunk.summarized.trim());
 	async function hypaPlusEvents(ctx, recentIds) {
 		let data = await risuai.pluginStorage.getItem("hypaplus_state_" + ctx.char.chaId + "_" + ctx.chat.id);
 		if (typeof data === "string") data = JSON.parse(data);
@@ -539,17 +610,39 @@
 				const body = String(node?.content || node?.text || "").trim();
 				if (!body) continue;
 				const when = [node.time, node.location].filter(Boolean).join(" · ");
+				const lines = (Array.isArray(node.dialogues) ? node.dialogues : []).filter((d) => typeof d?.speaker === "string" && typeof d?.text === "string" && d.text.trim()).map((d) => ({
+					speaker: d.speaker.trim(),
+					text: d.text.trim()
+				}));
 				events.push({
 					text: when ? `- ${when}: ${body}` : `- ${body}`,
-					who: Array.isArray(node.characters) ? node.characters.map(normalize) : []
+					who: Array.isArray(node.characters) ? node.characters.map(normalize) : [],
+					kind: node.type === "facts" ? "facts" : "event",
+					lines,
+					src: ids
 				});
 			}
-			if (!nodes.length && typeof chunk.summarized === "string" && chunk.summarized.trim()) events.push({
+			if (!nodes.length && summaryText(chunk)) events.push({
 				text: "- " + chunk.summarized.trim(),
 				who: []
 			});
 		}
 		return events;
+	}
+	async function summarizedIds(ctx) {
+		let data = null;
+		try {
+			data = await risuai.pluginStorage.getItem("hypaplus_state_" + ctx.char.chaId + "_" + ctx.chat.id);
+			if (typeof data === "string") data = JSON.parse(data);
+		} catch {
+			data = null;
+		}
+		const ids = new Set();
+		for (const chunk of Array.isArray(data?.chunks) ? data.chunks : []) {
+			if (!(Array.isArray(chunk.nodes) && chunk.nodes.length) && !summaryText(chunk)) continue;
+			for (const id of Array.isArray(chunk.chatIds) ? chunk.chatIds : []) ids.add(id);
+		}
+		return ids;
 	}
 	const STORY_SOURCES = [
 		["auto", "자동"],
@@ -609,7 +702,7 @@
 		}
 		return events.filter((e) => picked.has(e)).map((e) => e.text).join("\n");
 	}
-	async function storyMemory(ctx, members, recentIds, limit, source = "auto") {
+	async function storyMemory(ctx, members, recentIds, limit, source = "auto", options = {}) {
 		const order = source === "auto" ? [
 			"hypaplus",
 			"hypav3",
@@ -641,14 +734,34 @@
 				used: text ? 1 : 0
 			};
 		}
-		const names = members.flatMap((m) => [m.name, ...m.aliases || []]).map(normalize).filter((n) => n.length >= 2);
-		const related = (e) => e.who.some((w) => names.some((n) => w.includes(n) || n.includes(w))) || names.some((n) => normalize(e.text).includes(n));
+		const names = members.flatMap(memberNames);
+		const related = (e) => names.some((n) => normalize(e.text).includes(n));
+		const resolve = options.resolve || makeResolver(members);
+		let byId = null;
+		const around = (e) => () => {
+			byId ||= new Map((ctx.chat.message || []).map((m) => [m.chatId, String(m.data || "")]));
+			return [e.text, ...(e.src || []).map((id) => byId.get(id) || "")].join("\n");
+		};
+		const memberIds = new Set(members.map((m) => m.id));
+		for (const e of events) {
+			e.whoIds = [];
+			e.unclear = false;
+			for (const w of e.who) {
+				const id = resolve(w, e.who, around(e));
+				if (id) e.whoIds.push(id);
+				else if (resolve.owned(w)) e.unclear = true;
+			}
+		}
+		const mine = (e) => e.whoIds.some((id) => memberIds.has(id));
+		const listed = events.some(mine);
+		const loose = (e) => !e.who.length || !listed || e.unclear && !mine(e);
+		const own = (e) => loose(e) ? related(e) : mine(e);
 		const picked = new Set();
 		let left = limit;
 		for (const pass of [
-			(e) => e.important,
-			related,
-			() => true
+			(e) => e.important && (loose(e) || mine(e)),
+			own,
+			loose
 		]) {
 			for (let i = events.length - 1; i >= 0; i--) {
 				const e = events[i];
@@ -657,12 +770,42 @@
 				left -= e.text.length + 1;
 			}
 		}
+		const label = (e) => {
+			if (e.kind !== "facts" || members.length < 2) return e.text;
+			const knew = members.filter((m) => e.whoIds.includes(m.id)).map((m) => m.name);
+			return knew.length ? `${e.text} (아는 사람: ${knew.join(", ")})` : e.text;
+		};
 		return {
-			text: events.filter((e) => picked.has(e)).map((e) => e.text).join("\n"),
+			text: events.filter((e) => picked.has(e)).map(label).join("\n"),
 			source: used,
 			total: events.length,
-			used: picked.size
+			used: picked.size,
+			lines: speechLines(events, members, resolve, around)
 		};
+	}
+	const memberNames = (m) => [...new Set([...[m.name, ...m.aliases || []].map(normalize).filter((n) => n.length >= 2), ...(m.keys || []).map(normalize).filter((n) => n.length >= 3)])];
+	function speechLines(events, members, resolve = null, around = null) {
+		const out = {};
+		if (resolve) {
+			const ids = new Set(members.map((m) => m.id));
+			for (const e of events) for (const l of e.lines || []) {
+				const id = resolve(l.speaker, e.who || [], around ? around(e) : null);
+				if (!id || !ids.has(id)) continue;
+				const lines = out[id] ||= [];
+				if (!lines.includes(l.text)) lines.push(l.text);
+			}
+			return out;
+		}
+		for (const m of members) {
+			const own = memberNames(m);
+			const lines = [];
+			for (const e of events) for (const l of e.lines || []) {
+				const who = normalize(l.speaker);
+				if (who && own.some((n) => who.includes(n) || n.includes(who)) && !lines.includes(l.text)) lines.push(l.text);
+			}
+			if (lines.length) out[m.id] = lines;
+		}
+		return out;
 	}
 	async function parseCbs(text) {
 		if (!text || !String(text).includes("{{")) return String(text || "");
@@ -671,6 +814,12 @@
 		} catch {
 			return String(text);
 		}
+	}
+	function nameParticles(name) {
+		const n = String(name || "").trim(), last = n.charCodeAt(n.length - 1);
+		if (!(last >= 44032 && last <= 55203)) return "";
+		const has = (last - 44032) % 28 > 0;
+		return `조사는 "${n}${has ? "을" : "를"}", "${n}${has ? "이" : "가"}", "${n}${has ? "은" : "는"}", "${n}${has ? "과" : "와"}"처럼 이름의 받침에 맞춘다.`;
 	}
 	const normalize = (s) => String(s || "").toLowerCase().replace(/[\s_\-.·・()\[\]]/g, "");
 
@@ -766,8 +915,78 @@
 			seen.add(a.path);
 			list.push(a);
 		}
+		try {
+			const entries = await risuai.getCurrentLorebookEntries() || [];
+			list.codeLines = assetCodeLines(entries, list);
+			list.codeEntries = assetEntryCodes(entries, list);
+		} catch {}
 		view.assets = list;
 		return list;
+	}
+	function assetCodeLines(entries, assets) {
+		const index = assetIndex(assets), codes = new Set(index.exact.keys());
+		const codesIn = (item) => {
+			const whole = normalize(item);
+			if (codes.has(whole)) return [whole];
+			const stem = normalize(assetPersonName(item));
+			if (codes.has(stem)) return [stem];
+			return (item.match(/[\p{L}\p{N}]+/gu) || []).map(normalize).filter((t) => codes.has(t));
+		};
+		const common = (items) => {
+			const lists = items.map((i) => assetFlat(i).split("_").filter(Boolean));
+			const out = [];
+			for (let n = 0; lists.every((l) => l.length > n && l[n] === lists[0][n]); n++) out.push(lists[0][n]);
+			return out.join("_");
+		};
+		const out = new Map();
+		for (const e of entries) for (const line of String(e?.content || "").split("\n")) {
+			if (line.length > 400) continue;
+			const marked = [...line.matchAll(/`([^`]+)`/g)].map((m) => m[1]).concat([...line.matchAll(ASSET_TAG)].map((m) => m[1] || m[2]));
+			const items = marked.flatMap((s) => s.split(/\s*[|,]\s*/)).map((s) => s.trim()).filter(Boolean);
+			const shared = items.length > 1 ? normalize(common(items)) : "";
+			const found = new Set(shared && codes.has(shared) ? [shared] : items.flatMap(codesIn));
+			if (found.size !== 1) continue;
+			const code = [...found][0];
+			if (shared && code === shared) (out.groups ||= new Set()).add(code);
+			if (!out.has(code)) out.set(code, []);
+			if (out.get(code).length < 20) out.get(code).push(normalize(line));
+		}
+		return out;
+	}
+	const ASSET_TAG = /<img\b[^>]*?=\s*["']([^"']+)["']|\{\{\s*(?:image|img|asset|inlay)\s*::\s*([^}]+?)\s*\}\}/gi;
+	function assetEntryCodes(entries, assets) {
+		const index = assetIndex(assets), seen = new Map();
+		for (const e of entries) {
+			const title = normalize(baseTitle(String(e?.comment || String(e?.key || "").split(",")[0] || "").trim()));
+			if (!title) continue;
+			const codes = new Set();
+			for (const m of String(e?.content || "").matchAll(ASSET_TAG)) {
+				const code = normalize(assetPersonName((m[1] || m[2]).trim()));
+				if (index.exact.has(code)) codes.add(code);
+			}
+			const people = new Set([...codes].map((c) => [...codes].find((o) => o !== c && c.startsWith(o)) || c));
+			if (people.size >= 3) continue;
+			for (const code of codes) {
+				if (!seen.has(code)) seen.set(code, new Set());
+				seen.get(code).add(title);
+			}
+		}
+		const setOf = new Map();
+		for (const [code, titles] of seen) for (const t of titles) {
+			if (!setOf.has(t)) setOf.set(t, new Set());
+			setOf.get(t).add(code);
+		}
+		const sig = (t) => [...setOf.get(t)].sort().join("|");
+		const out = new Map();
+		for (const [code, titles] of seen) {
+			const list = [...titles];
+			if (list.length > 1 && !list.every((t) => sig(t) === sig(list[0]))) continue;
+			for (const title of list) {
+				if (!out.has(title)) out.set(title, new Set());
+				out.get(title).add(code);
+			}
+		}
+		return out;
 	}
 	function assetPrefixes(assets) {
 		const seen = new Set();
@@ -900,6 +1119,7 @@
 		const stem = String(name).replace(/\.(png|jpe?g|webp|gif|avif)$/i, "").split(".")[0];
 		return stem.split(/(?:_|\s)+(?:default|neutral|normal|profile|portrait|idle|basic|smile|happy|sad|angry|casual|school_uniform)(?=$|[_\s])/i)[0];
 	}
+	const assetFlat = (name) => String(name).toLowerCase().replace(/\.(png|jpe?g|webp|gif|avif)$/i, "").split(".")[0].trim().replace(/\s+/g, "_");
 	const assetRomajiKey = (name) => normalize(name).replace(/ou|oo/g, "o").replace(/uu/g, "u");
 	const assetIndexes = new WeakMap();
 	function assetIndex(assets) {
@@ -907,17 +1127,23 @@
 		if (!index) {
 			index = {
 				exact: new Map(),
-				roman: new Map()
+				roman: new Map(),
+				levels: new Map()
 			};
 			for (const a of assets) {
 				if (String(a.name).includes("__am__")) continue;
-				const prefix = normalize(assetPersonName(a.name));
-				if (!prefix) continue;
-				if (!index.exact.has(prefix)) index.exact.set(prefix, []);
-				index.exact.get(prefix).push(a);
-				const roman = assetRomajiKey(prefix);
-				if (!index.roman.has(roman)) index.roman.set(roman, new Set());
-				index.roman.get(roman).add(prefix);
+				const parts = assetFlat(a.name).split("_").filter(Boolean);
+				const levels = [];
+				for (let n = 1; n <= Math.min(parts.length - (parts.length > 1 ? 1 : 0), 3); n++) levels.push(normalize(parts.slice(0, n).join("_")));
+				index.levels.set(a, levels);
+				for (const prefix of new Set([normalize(assetPersonName(a.name)), ...levels])) {
+					if (!prefix || prefix.length < 2) continue;
+					if (!index.exact.has(prefix)) index.exact.set(prefix, []);
+					index.exact.get(prefix).push(a);
+					const roman = assetRomajiKey(prefix);
+					if (!index.roman.has(roman)) index.roman.set(roman, new Set());
+					index.roman.get(roman).add(prefix);
+				}
 			}
 			assetIndexes.set(assets, index);
 		}
@@ -927,6 +1153,27 @@
 		if (people) return people;
 		const state = typeof view !== "undefined" ? states.get(view.key) : null;
 		return [...state?.candidates || [], ...state?.contacts || []];
+	}
+	const ownerMaps = new WeakMap();
+	function nameOwners(catalog, ownerKey) {
+		let map = ownerMaps.get(catalog);
+		if (!map) {
+			map = new Map();
+			for (const c of catalog) {
+				const k = ownerKey(c);
+				for (const n of new Set([...contactNeedles(c), ...[
+					c.name,
+					...c.aliases || [],
+					...c.keys || []
+				].filter((x) => typeof x === "string").map(normalize)])) {
+					if (n.length < 2) continue;
+					if (!map.has(n)) map.set(n, new Set());
+					map.get(n).add(k);
+				}
+			}
+			ownerMaps.set(catalog, map);
+		}
+		return map;
 	}
 	function rankedAssets(contact, assets, people) {
 		const index = assetIndex(assets), needles = contactNeedles(contact);
@@ -955,20 +1202,55 @@
 				...String(contact.name || "").split(/\s+/)
 			].filter((n) => typeof n === "string").map(normalize).filter((n) => n.length >= 2);
 			const weak = new Set();
-			for (const alias of aliases) {
-				if (!index.exact.has(alias)) continue;
-				const owners = new Set(catalog.filter((c) => [
+			const rankOf = (c, alias) => {
+				if ([
 					c.name,
 					...c.aliases || [],
-					...c.keys || [],
 					...String(c.name || "").split(/\s+/)
-				].some((n) => normalize(n) === alias)).map(ownerKey));
-				if (owners.size > 1 || owners.size === 1 && !owners.has(ownKey)) continue;
+				].some((n) => normalize(n) === alias)) return -1;
+				const at = (c.keys || []).findIndex((k) => normalize(k) === alias);
+				return at < 0 ? null : at;
+			};
+			for (const alias of aliases) {
+				if (!index.exact.has(alias)) continue;
+				const best = new Map();
+				for (const c of catalog) {
+					const r = rankOf(c, alias);
+					if (r === null) continue;
+					const k = ownerKey(c);
+					best.set(k, Math.min(best.get(k) ?? Infinity, r));
+				}
+				if (!best.size) continue;
+				const top = Math.min(...best.values());
+				const winners = [...best].filter(([, r]) => r === top).map(([k]) => k);
+				if (winners.length !== 1 || winners[0] !== ownKey) continue;
 				weak.add(alias);
 			}
-			if (weak.size === 1) identities.add([...weak][0]);
+			const nested = [...weak].sort((x, y) => y.length - x.length);
+			if (weak.size === 1 || nested.length > 1 && nested.every((k) => nested[0].startsWith(k))) identities.add(nested[0]);
 		}
-		const hits = [...identities].flatMap((key) => index.exact.get(key) || []);
+		if (!identities.size && assets.codeLines) {
+			const namesOf = (c) => [...new Set([
+				c.name,
+				...c.aliases || [],
+				...c.keys || []
+			].filter((n) => typeof n === "string").map(normalize).filter((n) => n.length >= 3))];
+			const mine = namesOf(contact);
+			const others = catalog.filter((c) => ownerKey(c) !== ownKey).map(namesOf);
+			const coded = new Set();
+			for (const [code, lines] of assets.codeLines) {
+				if (!index.exact.has(code) || !inferredAllowed(code)) continue;
+				if (lines.some((l) => mine.some((n) => l.includes(n)) && !others.some((names) => names.some((n) => l.includes(n))))) coded.add(code);
+			}
+			if (coded.size === 1) identities.add([...coded][0]);
+		}
+		if (!identities.size && assets.codeEntries && contact.lore) {
+			for (const code of assets.codeEntries.get(normalize(baseTitle(String(contact.lore)))) || []) if (inferredAllowed(code)) identities.add(code);
+		}
+		const owners = nameOwners(catalog, ownerKey);
+		const longer = (level) => [...identities].some((id) => level !== id && level.startsWith(id));
+		const theirs = (level) => longer(level) && ([...owners.get(level) || []].some((k) => k !== ownKey) || !!assets.codeLines?.groups?.has(level));
+		const hits = [...new Set([...identities].flatMap((key) => index.exact.get(key) || []))].filter((a) => !(index.levels.get(a) || []).some(theirs));
 		return hits.slice().sort((x, y) => portraitScore(y.name) - portraitScore(x.name) || x.name.length - y.name.length);
 	}
 	const pickAsset = (contact, assets, people) => rankedAssets(contact, assets, people)[0]?.path || "";
@@ -989,10 +1271,22 @@
 		return changed;
 	}
 	const imageUrls = new Map();
+	const forgetImageUrl = (path) => imageUrls.delete(path);
 	async function imageUrl(path) {
 		if (!path) return "";
 		if (path.startsWith("data:")) return path;
 		if (imageUrls.has(path)) return imageUrls.get(path);
+		if (path.startsWith(PROFILE_REF)) {
+			let kept = "";
+			try {
+				kept = await risuai.pluginStorage.getItem(PROFILE_IMAGE_PREFIX + path.slice(PROFILE_REF.length));
+			} catch {
+				kept = "";
+			}
+			const url = typeof kept === "string" ? kept : "";
+			if (url) imageUrls.set(path, url);
+			return url;
+		}
 		let url = "";
 		try {
 			const data = await risuai.readImage(path);
@@ -1097,8 +1391,23 @@
 			}
 		}));
 	}
+	const QUOTE_PAIRS = {
+		"\"": "\"",
+		"'": "'",
+		"“": "”",
+		"「": "」",
+		"『": "』"
+	};
+	function unquote(text) {
+		let p = text.trim();
+		for (;;) {
+			const close = QUOTE_PAIRS[p[0]];
+			if (!close || p.length < 2 || p[p.length - 1] !== close || p.slice(1, -1).includes(close)) return p;
+			p = p.slice(1, -1).trim();
+		}
+	}
 	function parseLines(text) {
-		return text.split("\n").map((l) => l.replace(/^[\s\-*•\d.)`]+/, "").trim()).filter((l) => l.includes("|")).map((l) => l.split("|").map((p) => p.trim().replace(/^["'“”「」『』]+|["'“”「」『』]+$/g, "").replace(/^(출력|이름|답변?|결과)\s*[:：]\s*/, "")));
+		return text.split("\n").map((l) => l.replace(/^[\s\-*•\d.)`]+/, "").trim()).filter((l) => l.includes("|")).map((l) => l.split("|").map((p) => unquote(p).replace(/^(출력|이름|답변?|결과)\s*[:：]\s*/, "")));
 	}
 	const splitNames = (s) => String(s || "").split(/[,，、/]/).map((x) => x.trim()).filter(Boolean);
 	const baseTitle = (title) => title.split(/\s[-–—]\s/)[0].trim();
@@ -1123,7 +1432,8 @@
 			if (!candidate || typeof candidate.name !== "string" || !candidate.name.trim()) continue;
 			let resolved = candidate;
 			if (!candidate.lore && !candidate.loreId) {
-				const matches = sourced.filter((c) => [c.name, ...c.aliases || []].some((n) => normalize(n) === normalize(candidate.name)));
+				const own = [candidate.name, ...candidate.aliases || []].map(normalize).filter(Boolean);
+				const matches = sourced.filter((c) => [c.name, ...c.aliases || []].some((n) => own.includes(normalize(n))));
 				const keys = new Set(matches.map(personKey));
 				if (keys.size === 1) resolved = {
 					...candidate,
@@ -1148,7 +1458,15 @@
 				});
 			}
 		}
-		return [...found.values()];
+		const all = [...found.values()];
+		for (const c of all) {
+			const mine = new Set(c.aliases.map(normalize));
+			const swallowed = all.filter((o) => o !== c && normalize(o.name) !== normalize(c.name) && mine.has(normalize(o.name)));
+			if (!swallowed.length) continue;
+			const theirs = new Set(swallowed.flatMap((o) => [o.name, ...o.aliases || []]).map(normalize));
+			c.aliases = c.aliases.filter((a) => !theirs.has(normalize(a)));
+		}
+		return all;
 	}
 	function appearanceText(text) {
 		return String(text || "").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ").replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ").replace(/<!--[\s\S]*?-->/g, " ").replace(/<\/?[a-z][^>]*>/gi, " ").replace(/\{\{[\s\S]*?\}\}/g, " ").replace(/&(?:[a-z]+|#\d+|#x[a-f0-9]+);/gi, " ").replace(/\s+/g, " ").trim();
@@ -1174,26 +1492,53 @@
 		return null;
 	}
 	const NOT_A_PERSON = /템플릿|template|양식|예시|샘플|sample/i;
-	async function scanCandidatesRaw(ctx, state, onProgress) {
+	async function scanCandidatesRaw(ctx, state, onProgress, options = {}) {
 		const books = await loreBooks();
 		const assets = await gatherAssets(ctx);
 		const titles = new Map();
 		for (const entry of books) {
 			const title = loreTitle(entry);
 			const base = baseTitle(title);
+			const all = String(entry.key || "").split(",").map((k) => k.trim()).filter(Boolean);
 			if (base && !titles.has(normalize(base))) titles.set(normalize(base), {
 				title: base,
-				keys: String(entry.key || "").split(",").map((k) => k.trim()).filter(Boolean).slice(0, 4)
+				keys: all.slice(0, 4),
+				allKeys: all
 			});
 		}
 		const lines = [...titles.values()].map((t) => `${t.title} | ${t.keys.join(", ")}`);
 		const batches = [];
 		for (let i = 0; i < lines.length; i += SCAN_BATCH) batches.push(lines.slice(i, i + SCAN_BATCH));
+		const keyed = new Map();
+		for (const entry of books) for (const k of String(entry.key || "").split(",").map((x) => normalize(x)).filter((x) => x.length >= 2)) {
+			const base = baseTitle(loreTitle(entry));
+			if (!base) continue;
+			if (!keyed.has(k)) keyed.set(k, new Set());
+			keyed.get(k).add(normalize(base));
+		}
+		const ownEntry = (names) => {
+			for (const n of names) {
+				const t = titles.get(normalize(n));
+				if (t) return t;
+			}
+			for (const n of names) {
+				const set = keyed.get(normalize(n));
+				if (set?.size === 1) return titles.get([...set][0]);
+			}
+			return null;
+		};
+		const rows = [];
 		const found = new Map();
-		const add = (name, aliases, lore, asset) => {
+		const add = (name, aliases, lore, asset, shared) => {
 			name = String(name || "").trim();
 			if (!name || name.length > 24) return;
-			const known = lore && titles.get(normalize(baseTitle(lore)));
+			const given = lore && titles.get(normalize(baseTitle(lore)));
+			const own = ownEntry([name, ...aliases]);
+			const known = own || (given && !shared.has(normalize(given.title)) ? given : null);
+			if (own && normalize(own.title) !== normalize(name) && aliases.some((a) => normalize(a) === normalize(own.title))) {
+				aliases = [name, ...aliases.filter((a) => normalize(a) !== normalize(own.title))];
+				name = own.title;
+			}
 			const key = personKey({
 				name,
 				lore: known?.title || ""
@@ -1212,7 +1557,7 @@
 			])].filter((a) => normalize(a) !== normalize(item.name));
 			if (known && !item.lore) {
 				item.lore = known.title;
-				item.keys = known.keys;
+				item.keys = known.allKeys;
 			}
 			if (asset && !item.asset) item.asset = asset;
 			found.set(key, item);
@@ -1236,28 +1581,44 @@ ${batch.join("\n")}`;
 				for (const [name, aliases, lore] of parseLines(await askModel([{
 					role: "user",
 					content: prompt
-				}], null, "scan"))) add(name, splitNames(aliases), lore || name);
+				}], null, "scan"))) rows.push([
+					name,
+					splitNames(aliases),
+					lore || name
+				]);
 			} catch (e) {
 				failed++;
 				firstError ||= e.message;
 			}
 		}, report);
+		const users = new Map();
+		for (const [name, aliases, lore] of rows) {
+			const given = lore && titles.get(normalize(baseTitle(lore)));
+			if (!given || ownEntry([name, ...aliases]) || normalize(given.title) === normalize(name)) continue;
+			const k = normalize(given.title);
+			if (!users.has(k)) users.set(k, new Set());
+			users.get(k).add(normalize(name));
+		}
+		const shared = new Set([...users].filter(([, names]) => names.size >= 2).map(([k]) => k));
+		for (const [name, aliases, lore] of rows) add(name, aliases, lore, "", shared);
 		const story = (await storyWindow(ctx, 8e3)).text;
 		if (story.length > 200 && !view.scanJob?.stop) {
 			try {
+				const known = [...found.values(), ...state.contacts].map((f) => (f.aliases || []).length ? `${f.name}(${f.aliases.slice(0, 8).join(", ")})` : f.name);
 				const reply = await askModel([{
 					role: "user",
 					content: `아래 줄거리에서 이름이 나오는 사람 중 [이미 찾은 인물]에 없는 사람만 쓴다. 주인공 ${view.me?.name || ""}은 쓰지 않는다. 없으면 "없음"이라고만 쓴다.
+- [이미 찾은 인물]을 다른 이름·외국어 이름·별명·호칭으로 부른 것이면 새 사람으로 쓰지 않는다. 괄호 안은 그 인물의 다른 이름이다.
 설명 없이 한 줄에 한 명씩 다음 형식으로만 출력한다:
 이름|다른 이름들(쉼표로 구분)
 
 [이미 찾은 인물]
-${[...found.values()].map((f) => f.name).join(", ").slice(0, 6e3)}
+${[...new Set(known)].join(", ").slice(0, 6e3)}
 
 [줄거리]
 ${story}`
 				}], null, "scan");
-				for (const [name, aliases] of parseLines(reply)) add(name, splitNames(aliases));
+				for (const [name, aliases] of parseLines(reply)) add(name, splitNames(aliases), "", "", shared);
 			} catch (e) {
 				failed++;
 				firstError ||= e.message;
@@ -1275,14 +1636,14 @@ ${story}`
 [에셋 이름]
 ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				}], null, "scan");
-				for (const [name, aliases, asset] of parseLines(reply)) add(name, splitNames(aliases), "", asset);
+				for (const [name, aliases, asset] of parseLines(reply)) add(name, splitNames(aliases), "", asset, shared);
 			} catch (e) {
 				failed++;
 				firstError ||= e.message;
 			}
 		}
 		const me = normalize(view.me?.name);
-		state.candidates = dedupeCandidates([...state.candidates || [], ...found.values()].filter((c) => normalize(c.name) !== me && !NOT_A_PERSON.test(c.name)));
+		state.candidates = dedupeCandidates([...options.replace ? [] : state.candidates || [], ...found.values()].filter((c) => normalize(c.name) !== me && !NOT_A_PERSON.test(c.name)));
 		state.scannedAt = Date.now();
 		state.scannedMessages = (ctx.chat.message || []).length;
 		return {
@@ -1626,6 +1987,728 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 	}
 
 //#endregion
+//#region src/chat/relationships.js
+	const relationshipMessage = (m) => (m.role === "user" ? "[PC] " : "") + cleanStory(m.data);
+	const relationshipFields = [
+		"relation",
+		"feeling",
+		"promises"
+	];
+	const relationshipInstructions = `relation은 사건이 끝난 뒤에도 지속되는 상대별 현재 관계 상태다. 무슨 행동을 했는지 나열하는 사건 경위와 구분한다. 예를 들어 "함께 협약서에 서명했다"는 사건이고 "서로 협력하는 동맹 관계다"는 현재 관계다. 한 번의 행동만으로 관계를 추정하지 않고, 원문에서 확정되거나 사용자가 명시한 관계 및 이후 변화를 반영한다. 관계 종류는 정해진 단계 없이 자유롭게 서술한다.
+feeling은 그 상대에 대한 감정, promises는 현재 유효한 약속 목록이며 관계와 독립적으로 갱신한다. 관계가 변했다고 감정도 같다고 추정하지 않는다. 바뀐 항목만 쓰며 약속이 모두 끝났으면 promises:[]다. 관계 종료는 끝난 관계와 현재 상태를 relation에 쓴다. 사용자가 확정한 설정 메모리를 추측으로 뒤집지 않는다. 변화가 없는 새 사건을 relation에 대신 적지 않는다.`;
+	function relationshipPatch(row) {
+		const patch = {};
+		for (const field of relationshipFields) {
+			if (!Object.hasOwn(row, field)) continue;
+			const value = row[field];
+			if (value === null) patch[field] = null;
+			else if (field === "promises" && Array.isArray(value) && value.every((v) => typeof v === "string")) patch[field] = value.map((v) => v.trim());
+			else if (field !== "promises" && typeof value === "string") patch[field] = value.trim();
+		}
+		return patch;
+	}
+	function applyRelationships(state, updates, source, pcName) {
+		if (!Array.isArray(updates) || !Array.isArray(source?.messages) || !source.messages.length) return 0;
+		const people = state.contacts || [], resolve = makeResolver(people);
+		const person = (name) => people.find((p) => p.id === name)?.id || (typeof name === "string" ? resolve(name) : null);
+		let changed = 0;
+		for (const row of updates) {
+			if (!row || typeof row !== "object") continue;
+			const who = person(row.who);
+			const target = row.target === "me" || typeof row.target === "string" && normalize(row.target) === normalize(pcName) ? "me" : person(row.target);
+			const at = typeof row.at === "string" ? row.at : source.messages.length === 1 ? source.messages[0].id : "";
+			const index = source.messages.findIndex((m) => m.id === at);
+			if (!who || !target || who === target || index < 0) continue;
+			if (source.members && !source.members.includes(who)) continue;
+			const patch = relationshipPatch(row);
+			if (!Object.keys(patch).length) continue;
+			const message = source.messages[index];
+			const anchor = message.anchor || {
+				id: source.anchor || "",
+				index: source.anchorIndex ?? -1
+			};
+			const origin = {
+				kind: source.kind,
+				at,
+				evidence: [{
+					id: message.id,
+					text: message.full || message.text
+				}],
+				...source.observedAt ? {
+					observedAt: source.observedAt,
+					observedSeq: source.observedSeq ?? 0
+				} : {},
+				...source.revision !== undefined ? { revision: source.revision } : {},
+				...source.kind === "chat" ? {
+					roomId: source.roomId,
+					anchor: anchor.id,
+					anchorIndex: anchor.index,
+					seq: message.order ?? source.seq ?? 0
+				} : {}
+			};
+			const contact = people.find((p) => p.id === who);
+			const history = contact.relationshipHistory ||= [];
+			const same = JSON.stringify({
+				target,
+				patch,
+				source: origin
+			});
+			if (history.some((r) => !r.invalidated && JSON.stringify({
+				target: r.target,
+				patch: r.patch,
+				source: r.source
+			}) === same)) continue;
+			history.push({
+				id: newId(),
+				target,
+				patch,
+				source: origin
+			});
+			changed++;
+		}
+		return changed;
+	}
+	function relationshipEntries(contact, state, chat) {
+		const main = new Map((chat?.message || []).filter((m) => m.chatId).map((m, index) => [m.chatId, {
+			index,
+			text: relationshipMessage(m)
+		}]));
+		const rooms = new Map((state.rooms || []).map((r) => [r.id, new Map((r.msgs || []).map((m) => [m.id, String(m.text || "")]))]));
+		return (contact.relationshipHistory || []).flatMap((record, index) => {
+			const s = record.source;
+			if (record.invalidated || !s || !Array.isArray(s.evidence) || !s.evidence.length) return [];
+			const origin = s.kind === "story" ? main : s.kind === "chat" ? rooms.get(s.roomId) : null;
+			if (!origin || !s.evidence.every((e) => origin.has(e.id) ? (s.kind === "story" ? origin.get(e.id)?.text : origin.get(e.id)) === e.text : s.kind === "chat" && e.retained === true)) return [];
+			const observed = main.get(s.observedAt)?.index;
+			if (observed !== undefined) return [{
+				record,
+				order: [
+					observed,
+					1,
+					s.observedSeq || 0,
+					index
+				]
+			}];
+			const position = s.kind === "story" ? main.get(s.at)?.index : main.get(s.anchor)?.index ?? s.anchorIndex ?? -1;
+			if (position === undefined) return [];
+			return [{
+				record,
+				order: [
+					position,
+					s.kind === "chat" ? 1 : 0,
+					s.seq || 0,
+					index
+				]
+			}];
+		}).sort((a, b) => {
+			for (let i = 0; i < a.order.length; i++) if (a.order[i] !== b.order[i]) return a.order[i] - b.order[i];
+			return 0;
+		});
+	}
+	function currentRelationships(contact, state, chat) {
+		const current = Object.create(null);
+		for (const { record } of relationshipEntries(contact, state, chat)) {
+			const value = current[record.target] ||= {};
+			for (const [field, content] of Object.entries(relationshipPatch(record.patch || {}))) {
+				if (content === null || content === "") delete value[field];
+				else value[field] = content;
+			}
+		}
+		return current;
+	}
+	function relationshipBlock(members, state, chat, actor = "me") {
+		return members.map((m) => {
+			const value = currentRelationships(m, state, chat)[actor];
+			if (!value || !Object.keys(value).length) return "";
+			const target = actor === "me" ? "현재 사용자" : state.contacts.find((c) => c.id === actor)?.name || actor;
+			return [
+				`## ${m.name} → ${target}`,
+				value.relation ? `관계: ${value.relation}` : "",
+				value.feeling ? `감정: ${value.feeling}` : "",
+				value.promises ? `유효한 약속: ${value.promises.length ? value.promises.join(" / ") : "없음"}` : ""
+			].filter(Boolean).join("\n");
+		}).filter(Boolean).join("\n\n");
+	}
+	function rewindRelationships(state, roomId, messageIds) {
+		const ids = new Set(messageIds);
+		for (const c of state.contacts || []) for (const record of c.relationshipHistory || []) {
+			if (record.source?.kind === "chat" && record.source.roomId === roomId && record.source.evidence?.some((e) => ids.has(e.id))) record.invalidated = true;
+		}
+	}
+	function stampRelationshipMessage(message, chat) {
+		if (!message || message.relationshipAnchor || !chat) return;
+		const main = chat.message || [];
+		message.relationshipAnchor = {
+			id: main.at(-1)?.chatId || "",
+			index: main.length - 1
+		};
+	}
+	function retainRelationshipEvidence(state, room, removed) {
+		const gone = new Map(removed.map((m) => [m.id, String(m.text || "")]));
+		for (const c of state?.contacts || []) for (const record of c.relationshipHistory || []) {
+			if (record.invalidated || record.source?.kind !== "chat" || record.source.roomId !== room.id) continue;
+			for (const e of record.source.evidence || []) if (gone.has(e.id) && gone.get(e.id) === e.text) e.retained = true;
+		}
+	}
+	function mergeRelationships(contact, history, ids, rooms, messages, sameChat) {
+		if (!Array.isArray(history)) return;
+		for (const raw of history) {
+			const source = raw?.source;
+			if (!source || !["story", "chat"].includes(source.kind) || !Array.isArray(source.evidence) || !source.evidence.every((e) => typeof e?.id === "string" && typeof e.text === "string")) continue;
+			const target = raw.target === "me" ? "me" : ids.get(raw.target);
+			const patch = relationshipPatch(raw.patch || {});
+			if (!target || !Object.keys(patch).length) continue;
+			const copy = JSON.parse(JSON.stringify(raw));
+			copy.target = target;
+			copy.patch = patch;
+			if (source.kind === "chat") {
+				if (!rooms.has(source.roomId)) continue;
+				const mapped = (id) => messages.get(JSON.stringify([source.roomId, id])) || id;
+				copy.source.roomId = rooms.get(source.roomId);
+				copy.source.at = mapped(source.at);
+				copy.source.evidence = source.evidence.map((e) => ({
+					...e,
+					id: mapped(e.id)
+				}));
+				if (!sameChat) {
+					copy.source.anchor = "";
+					copy.source.anchorIndex = -1;
+				}
+			}
+			const all = contact.relationshipHistory ||= [];
+			const identity = (r) => JSON.stringify({
+				target: r.target,
+				patch: r.patch,
+				source: r.source,
+				invalidated: r.invalidated
+			});
+			if (all.some((r) => identity(r) === identity(copy))) continue;
+			if (typeof copy.id !== "string" || all.some((r) => r.id === copy.id)) copy.id = newId();
+			all.push(copy);
+		}
+	}
+
+//#endregion
+//#region src/chat/story-memory.js
+	const STORY_ACTIVE = 60;
+	const VOICE_LINES = 4;
+	const hashOf = (text) => {
+		let h = 5381;
+		for (let i = 0; i < text.length; i++) h = h * 33 + text.charCodeAt(i) | 0;
+		return (h >>> 0).toString(36) + ":" + text.length;
+	};
+	const messageText = (m) => (m.role === "user" ? "[PC] " : "") + cleanStory(m.data);
+	const storyEnd = (chat) => (chat?.message || []).filter((m) => m.chatId).map(messageText).filter((t) => t.trim()).length - 1;
+	const storyOf = (c) => (Array.isArray(c?.memory) ? c.memory : []).filter((x) => x.type === "story");
+	function batches(messages, limit) {
+		const out = [];
+		let cur = [], size = 0;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			const len = m.text.length + 2;
+			if (cur.length && size + len > limit) {
+				out.push(cur);
+				cur = [];
+				size = 0;
+			}
+			cur.unshift(len > limit ? {
+				...m,
+				text: m.text.slice(-limit),
+				full: m.text
+			} : m);
+			size += Math.min(len, limit);
+		}
+		if (cur.length) out.push(cur);
+		return out;
+	}
+	async function storyPlan(ctx, state, limit, { includeHistory = false } = {}) {
+		const covered = await summarizedIds(ctx);
+		const all = (ctx.chat.message || []).filter((m) => m.chatId).map((m) => ({
+			id: m.chatId,
+			text: messageText(m)
+		})).filter((m) => m.text.trim());
+		all.forEach((m, i) => {
+			m.i = i;
+		});
+		const tail = all.filter((m) => !covered.has(m.id));
+		const at = new Map(all.map((m, i) => [m.id, i]));
+		let cur = state.storyCursor && typeof state.storyCursor === "object" ? state.storyCursor : null;
+		let changed = false;
+		if (cur) {
+			const gone = [];
+			for (const [id, h] of Object.entries(cur.done || {})) {
+				if (covered.has(id)) {
+					delete cur.done[id];
+					changed = true;
+					continue;
+				}
+				const m = tail.find((x) => x.id === id);
+				if (!m || hashOf(m.text) !== h) {
+					gone.push(id);
+					delete cur.done[id];
+					changed = true;
+				}
+			}
+			if (gone.length) {
+				const g = new Set(gone);
+				for (const c of state.contacts || []) {
+					const before = (c.memory || []).length;
+					c.memory = (c.memory || []).filter((x) => !(x.type === "story" && (x.src || []).some((id) => g.has(id))));
+					if (c.memory.length !== before) changed = true;
+				}
+			}
+		}
+		let from = cur && at.has(cur.from) ? at.get(cur.from) : -1;
+		if (from < 0 && cur) {
+			const kept = Object.keys(cur.done || {}).map((id) => at.get(id)).filter((i) => i >= 0);
+			from = kept.length ? Math.min(...kept) : -1;
+		}
+		if (from < 0) {
+			const newest = batches(tail, limit)[0] || [];
+			const start = covered.size ? tail[0] : newest[0];
+			state.storyCursor = cur = {
+				from: start?.id || "",
+				done: cur?.done || {}
+			};
+			from = start ? at.get(start.id) : all.length;
+			changed = true;
+		} else if (!at.has(cur.from)) {
+			cur.from = all[from]?.id || "";
+			changed = true;
+		}
+		const waiting = tail.filter((m) => (includeHistory || at.get(m.id) >= from) && !cur.done[m.id]);
+		const newest = batches(tail, limit)[0] || [];
+		const latest = newest.filter((m) => !cur.done[m.id]);
+		const newestIds = new Set(newest.map((m) => m.id));
+		const older = tail.filter((m) => !newestIds.has(m.id) && !cur.done[m.id]);
+		return {
+			batches: batches(waiting, limit),
+			latest,
+			covered,
+			changed,
+			olderMessageCount: older.length,
+			olderBatchCount: batches(older, limit).length
+		};
+	}
+	function ownLines(m, lines, story) {
+		const names = memberNames(m);
+		const out = [];
+		for (const l of Array.isArray(lines) ? lines : []) {
+			const text = typeof l?.text === "string" ? l.text.trim() : "";
+			const who = normalize(l?.speaker);
+			if (!text || !who || !names.some((n) => who === n) || !story.includes(text) || out.includes(text)) continue;
+			out.push(text);
+			if (out.length >= VOICE_LINES) break;
+		}
+		return out;
+	}
+	function settleStory(c) {
+		const live = storyOf(c).filter((x) => !x.archived).sort((a, b) => a.t - b.t);
+		for (const x of live.slice(0, Math.max(0, live.length - STORY_ACTIVE))) x.archived = true;
+	}
+	const jobs = new Map();
+	const storyReads = new Map();
+	function readStory(key, state, batch, members, pcName, { validate, prepare } = {}) {
+		const jobKey = key + "|" + batch.map((m) => m.id).join(",");
+		if (!jobs.has(jobKey)) {
+			const job = {
+				validators: new Set(),
+				preparers: new Set(),
+				promise: null
+			};
+			if (validate) job.validators.add(validate);
+			if (prepare) job.preparers.add(prepare);
+			const validateAll = async () => {
+				for (const check of job.validators) if (!await check()) return false;
+				return true;
+			};
+			const task = (storyReads.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
+				let input = batch;
+				for (const refresh of job.preparers) input = await refresh(input);
+				return readStoryRaw(state, input, members, pcName, validateAll);
+			}).finally(() => {
+				jobs.delete(jobKey);
+				if (storyReads.get(key) === task) storyReads.delete(key);
+			});
+			job.promise = task;
+			jobs.set(jobKey, job);
+			storyReads.set(key, task);
+		} else {
+			if (validate) jobs.get(jobKey).validators.add(validate);
+			if (prepare) jobs.get(jobKey).preparers.add(prepare);
+		}
+		return jobs.get(jobKey).promise;
+	}
+	function storyReadInput(state, batch, members, pcName) {
+		const text = batch.map((m) => m.text).join("\n\n");
+		const labeled = batch.map((m) => `[message:${m.id}]\n${m.text}`).join("\n\n");
+		const body = normalize(text);
+		const roomIds = new Set(members.map((m) => m.id));
+		const people = (state.contacts || []).filter((c) => c.id !== "me" && (roomIds.has(c.id) || memberNames(c).some((n) => body.includes(n)))).slice(0, 12);
+		const prev = people.filter((p) => p.storyNow?.text).map((p) => `${p.name}: ${p.storyNow.text}`);
+		const prompt = `아래 [새 본편]은 RP 본편에서 새로 일어난 장면이다. 모든 장면을 보는 서술자의 기록이다. 인물마다 그 인물이 직접 겪은 일만 그 인물의 기억으로 정리한다.
+사용자: ${pcName}
+인물: ${people.map((p) => p.name).join(", ")}
+${people.some((p) => (p.aliases || []).length) ? `다른 이름: ${people.filter((p) => (p.aliases || []).length).map((p) => `${p.name}=${p.aliases.join("/")}`).join(", ")}\n` : ""}${prev.length ? `[지난번 "지금"]\n${prev.join("\n")}\n` : ""}규칙:
+- events: 그 인물이 그 자리에 있어 직접 보고 들은 일과, 장면 안에서 누군가에게 말로 전해 들은 일만 쓴다. 사건 하나에 한 문장으로, 그 인물의 1인칭 시점("나는 …")으로 쓴다. 사용자는 "${pcName}"(으)로 부른다. ${nameParticles(pcName)} 며칠 뒤에도 기억할 만한 일만 쓴다. 그 인물이 없던 장면, 다른 인물의 속마음, 서술자만 아는 설명은 쓰지 않는다. 없으면 빈 배열이다.
+- now: [새 본편] 끝에서 그 인물이 어디서 무엇을 하는지와 누구와 같은 장소에 있는지 한 문장. [새 본편]에 그 인물이 나오지 않으면 빈 문자열이다.
+- lines: 그 인물이 [새 본편]에서 큰따옴표 안에 직접 한 대사를 원문 그대로 최대 ${VOICE_LINES}개. 평소 말투가 드러나는 것을 우선한다. speaker에는 그 대사를 말한 인물의 이름을 쓴다. 없으면 빈 배열이다.
+- relationships: 이 장면으로 성립하거나 변경된 상대별 현재 관계를 쓴다. target은 사용자면 me, 다른 인물이면 그 이름이다. at은 변화 근거의 message ID다. relation(관계), feeling(상대에 대한 감정), promises(현재 유효한 약속 목록)는 서로 독립된 서술이며 실제 바뀐 항목만 쓴다. 약속을 모두 해소했으면 promises:[]로 쓴다. 관계 종료도 무엇이 끝났는지 relation으로 쓴다. 순간적인 감정이나 대사 한마디만으로 관계를 추정하지 않고, 장면에서 성립한 변화와 사용자가 명시한 상태를 반영한다. 변화가 없으면 빈 배열이다.
+${relationshipInstructions}
+- 고유명사는 본편 표기를 그대로 쓰고, 본편에 없는 일을 지어내지 않는다.
+JSON 하나만 출력한다: {"people":[{"who":"인물 이름","events":[""],"now":"","lines":[{"speaker":"말한 인물","text":"대사 원문"}],"relationships":[{"target":"me","at":"근거 message ID","relation":"변경된 관계"}]}]}
+
+[새 본편]
+${labeled}`;
+		return {
+			prompt,
+			text,
+			people
+		};
+	}
+	async function readStoryRaw(state, batch, members, pcName, validate) {
+		const cur = state.storyCursor ||= {
+			from: batch[0]?.id || "",
+			done: {}
+		};
+		cur.done ||= {};
+		if (validate && !await validate()) throw new Error("본편이 바뀌었어요. 미처리분을 다시 확인해 주세요.");
+		batch = batch.filter((m) => cur.done[m.id] !== hashOf(m.full || m.text));
+		if (!batch.length) return 0;
+		const position = Math.max(-1, ...batch.map((m) => m.i ?? -1));
+		const { prompt, text, people } = storyReadInput(state, batch, members, pcName);
+		if (people.length) {
+			const raw = parseCard(await askModel([{
+				role: "user",
+				content: prompt
+			}], null, "story-memory"));
+			if (validate && !await validate()) throw new Error("정리 중 본편이 바뀌었어요. 미처리분을 다시 확인해 주세요.");
+			if (!raw) throw new Error("본편 기억 응답을 해석하지 못했습니다");
+			const resolve = makeResolver(people);
+			const src = batch.map((m) => m.id);
+			const now = Date.now();
+			for (const p of Array.isArray(raw.people) ? raw.people : []) {
+				if (typeof p?.who !== "string") continue;
+				const id = resolve(p.who) || people.find((c) => normalize(c.name) === normalize(p.who))?.id;
+				const c = people.find((x) => x.id === id);
+				if (!c) continue;
+				const events = (Array.isArray(p.events) ? p.events : []).filter((e) => typeof e === "string").map((e) => e.replace(/\s+/g, " ").trim().slice(0, MEMORY_TEXT)).filter(Boolean);
+				const have = new Set(storyOf(c).map((x) => x.text));
+				c.memory = [...Array.isArray(c.memory) ? c.memory : [], ...events.filter((e) => !have.has(e)).map((e, i) => ({
+					id: newId(),
+					type: "story",
+					text: e,
+					t: now + i,
+					by: "story",
+					src
+				}))];
+				if (typeof p.now === "string" && p.now.trim() && !(c.storyNow?.at > position)) c.storyNow = {
+					text: p.now.replace(/\s+/g, " ").trim().slice(0, MEMORY_TEXT),
+					t: now,
+					at: position
+				};
+				const lines = ownLines(c, p.lines, text);
+				if (lines.length && !(c.storyLinesAt > position)) {
+					c.storyLines = [...lines, ...(c.storyLines || []).filter((l) => !lines.includes(l))].slice(0, VOICE_LINES);
+					c.storyLinesAt = position;
+				} else if (lines.length) c.storyLines = [...c.storyLines || [], ...lines.filter((l) => !(c.storyLines || []).includes(l))].slice(0, VOICE_LINES);
+				applyRelationships(state, (Array.isArray(p.relationships) ? p.relationships : []).map((r) => ({
+					...r,
+					who: c.id
+				})), {
+					kind: "story",
+					messages: batch,
+					members: [c.id]
+				}, pcName);
+				settleStory(c);
+			}
+		}
+		for (const m of batch) cur.done[m.id] = hashOf(m.full || m.text);
+		return people.length;
+	}
+
+//#endregion
+//#region src/chat/story-backlog.js
+	const storyBacklogJobs = new Map();
+	function noteStoryBacklog(state, plan) {
+		if (state.storyBacklogNotice?.status && state.storyBacklogNotice.status !== "pending") return;
+		if (plan.olderMessageCount > 0) state.storyBacklogNotice = {
+			status: "pending",
+			messageCount: plan.olderMessageCount,
+			batchCount: plan.olderBatchCount
+		};
+		else if (plan.olderMessageCount === 0 && state.storyBacklogNotice?.status === "pending") delete state.storyBacklogNotice;
+	}
+	function estimateStoryTokens(text) {
+		const ascii = (text.match(/[\x00-\x7f]/g) || []).length;
+		const other = [...text].length - ascii;
+		return {
+			min: Math.ceil(ascii / 4 + other * .7),
+			max: Math.ceil(ascii / 2 + other * 1.5)
+		};
+	}
+	async function storyBatchUnchanged(ctx, batch) {
+		const chat = Number.isInteger(ctx.charIndex) && Number.isInteger(ctx.chatIndex) ? await risuai.getChatFromIndex(ctx.charIndex, ctx.chatIndex) : ctx.chat;
+		if (!chat || chat.id !== ctx.chat.id) return false;
+		const messages = new Map((chat.message || []).map((m) => [m.chatId, (m.role === "user" ? "[PC] " : "") + cleanStory(m.data)]));
+		return batch.every((m) => messages.get(m.id) === (m.full || m.text));
+	}
+	async function inspectStoryBacklog(ctx, state) {
+		const plan = await storyPlan(ctx, state, MODES[modeOf(state)].story, { includeHistory: true });
+		const pcName = await parseCbs("{{user}}");
+		const tokenEstimates = plan.batches.map((batch) => {
+			const input = storyReadInput(state, batch, [], pcName);
+			return input.people.length ? estimateStoryTokens(input.prompt) : {
+				min: 0,
+				max: 0
+			};
+		});
+		return {
+			key: ctx.key,
+			ctx,
+			state,
+			batches: plan.batches,
+			tokenEstimates,
+			messageCount: plan.batches.reduce((n, b) => n + b.length, 0)
+		};
+	}
+	function stopStoryBacklog(key) {
+		const job = storyBacklogJobs.get(key);
+		if (job?.status === "running") {
+			job.stopping = true;
+			render();
+		}
+	}
+	function startStoryBacklog(plan, count) {
+		const active = storyBacklogJobs.get(plan.key);
+		if (active?.status === "running") return active.promise;
+		const selected = plan.batches.slice(0, Math.max(0, Math.min(plan.batches.length, Math.floor(count))));
+		const job = {
+			status: "running",
+			done: 0,
+			total: selected.length,
+			stopping: false,
+			error: ""
+		};
+		storyBacklogJobs.set(plan.key, job);
+		job.promise = (async () => {
+			try {
+				const pcName = await parseCbs("{{user}}");
+				for (const batch of selected) {
+					if (job.stopping) break;
+					const validate = () => storyBatchUnchanged(plan.ctx, batch);
+					if (!await validate()) throw new Error("본편이 바뀌었어요. 미처리분을 다시 확인해 주세요.");
+					const prepare = async (queued) => {
+						const waiting = await storyPlan(plan.ctx, plan.state, MODES[modeOf(plan.state)].story, { includeHistory: true });
+						const ids = new Set(waiting.batches.flatMap((b) => b.map((m) => m.id)));
+						return queued.filter((m) => ids.has(m.id));
+					};
+					await readStory(plan.key, plan.state, batch, [], pcName, {
+						validate,
+						prepare
+					});
+					await saveState(plan.key);
+					job.done++;
+					render();
+				}
+				job.status = job.stopping && job.done < job.total ? "stopped" : "done";
+			} catch (e) {
+				job.status = "failed";
+				job.error = e.message;
+			} finally {
+				render();
+			}
+			return job;
+		})();
+		render();
+		return job.promise;
+	}
+
+//#endregion
+//#region src/ui/screens/story-backlog.js
+	async function loadStoryBacklogPlan(state) {
+		const key = view.key;
+		view.storyBacklogLoading = key;
+		view.storyBacklogError = "";
+		render();
+		try {
+			const ctx = await getContext();
+			if (!ctx || ctx.key !== key) throw new Error("챗이 바뀌었어요. 이 채팅에서 다시 확인해 주세요.");
+			const found = await inspectStoryBacklog(ctx, state);
+			if (view.key === key) {
+				view.storyBacklogPlan = found;
+				view.storyBacklogCount = 1;
+			}
+		} catch (e) {
+			if (view.key === key) view.storyBacklogError = e.message;
+		} finally {
+			if (view.storyBacklogLoading === key) view.storyBacklogLoading = "";
+			render();
+		}
+	}
+	async function chooseStoryBacklogNotice(state, status) {
+		const key = view.key, before = state.storyBacklogNotice;
+		if (view.storyBacklogNoticeSaving === key) return false;
+		const next = {
+			...before,
+			status
+		};
+		state.storyBacklogNotice = next;
+		view.storyBacklogNoticeSaving = key;
+		view.storyBacklogError = "";
+		try {
+			await saveState(key);
+			return true;
+		} catch {
+			if (state.storyBacklogNotice === next) state.storyBacklogNotice = before;
+			view.storyBacklogError = "안내 선택을 저장하지 못했어요. 다시 눌러 주세요.";
+			return false;
+		} finally {
+			if (view.storyBacklogNoticeSaving === key) view.storyBacklogNoticeSaving = "";
+			render();
+		}
+	}
+	function storyBacklogCard(state, { dialog = false } = {}) {
+		const key = view.key, job = storyBacklogJobs.get(key);
+		const plan = view.storyBacklogPlan?.key === key && view.storyBacklogPlan.state === state ? view.storyBacklogPlan : null;
+		const loading = view.storyBacklogLoading === key;
+		const running = job?.status === "running";
+		const count = plan ? Math.min(plan.batches.length, view.storyBacklogCount === "all" ? plan.batches.length : Number(view.storyBacklogCount) || 1) : 0;
+		const tokens = (plan?.tokenEstimates || []).slice(0, count).reduce((sum, n) => ({
+			min: sum.min + n.min,
+			max: sum.max + n.max
+		}), {
+			min: 0,
+			max: 0
+		});
+		const estimate = h("div", {
+			class: "backlog-cost",
+			"data-t": "story-backlog-estimate"
+		}, h("strong", { "data-t": "story-backlog-tokens" }, `예상 입력 약 ${tokens.min.toLocaleString()}~${tokens.max.toLocaleString()} 토큰`), h("div", { class: "sub" }, `선택한 ${count}묶음 · 모델 호출 최대 ${count}회`), h("div", { class: "sub" }, "본문·공통 지시문을 포함한 문자 수 기반 추정이에요. 출력 토큰은 별도이며 모델에 따라 달라져요."));
+		const selection = plan?.batches.length ? h("div", {}, h("label", { class: "field flat" }, h("span", { class: "label" }, "정리 범위"), h("select", {
+			"data-t": "story-backlog-range",
+			"aria-label": "정리 범위",
+			onchange: (e) => {
+				view.storyBacklogCount = e.target.value === "all" ? "all" : 1;
+				render();
+			}
+		}, h("option", {
+			value: "recent",
+			selected: view.storyBacklogCount !== "all"
+		}, "최근 N묶음"), h("option", {
+			value: "all",
+			selected: view.storyBacklogCount === "all"
+		}, "미처리 전체"))), view.storyBacklogCount !== "all" ? h("label", { class: "field flat" }, h("span", { class: "label" }, "묶음 수"), h("input", {
+			type: "number",
+			min: 1,
+			max: plan.batches.length,
+			step: 1,
+			value: count,
+			"data-t": "story-backlog-count",
+			"aria-label": "묶음 수",
+			onchange: (e) => {
+				view.storyBacklogCount = Math.max(1, Math.min(plan.batches.length, Math.floor(Number(e.target.value) || 1)));
+				render();
+			}
+		})) : null, estimate, h("div", { class: "actions flush" }, h("button", {
+			class: "pill primary",
+			"data-t": "story-backlog-start",
+			disabled: view.storyBacklogNoticeSaving === key,
+			onclick: async () => {
+				if (!await chooseStoryBacklogNotice(state, "started")) return;
+				const pending = startStoryBacklog(plan, count);
+				render();
+				pending.finally(() => {
+					if (view.storyBacklogPlan === plan) view.storyBacklogPlan = null;
+					render();
+				});
+			}
+		}, "선택한 범위 정리 시작"))) : null;
+		return h("section", {
+			class: "card backlog-card",
+			"data-t": "story-backlog-card"
+		}, dialog ? null : h("h3", {}, "과거 줄거리 정리"), h("div", { class: "sub" }, "답장에서는 최신 묶음만 자동 정리해요. 과거 미처리분은 여기서 범위를 골라 정리합니다. 기존 요약과 저장된 기억은 계속 사용해요."), running ? h("div", {
+			"data-t": "story-backlog-progress",
+			role: "status"
+		}, `${job.done}/${job.total}묶음 완료${job.stopping ? " · 현재 묶음 완료 후 중지합니다." : ""}`) : null, running ? h("button", {
+			class: "pill",
+			"data-t": "story-backlog-stop",
+			disabled: job.stopping,
+			onclick: () => stopStoryBacklog(key)
+		}, "현재 묶음 완료 후 중지") : null, !running && job ? h("div", {
+			class: "sub",
+			"data-t": "story-backlog-result",
+			role: "status"
+		}, `${job.done}/${job.total}묶음 완료 · ${job.status === "done" ? "정리 완료" : job.status === "stopped" ? "중지됨" : "실패: " + job.error}. 완료한 결과는 보존됩니다.`) : null, !running && !plan ? h("button", {
+			class: "pill top-gap",
+			"data-t": "story-backlog-inspect",
+			disabled: loading || state.storyIn === false,
+			onclick: () => loadStoryBacklogPlan(state)
+		}, loading ? "미처리분 확인 중…" : "미처리분 확인 (모델 호출 없음)") : null, state.storyIn === false ? h("div", { class: "sub" }, "본편 → 메신저를 켜면 정리할 수 있어요.") : null, !running && plan ? h("div", { class: "backlog-overview" }, h("span", {
+			"data-t": "story-backlog-pending",
+			class: "sub"
+		}, `미처리 메시지 ${plan.messageCount}개 · ${plan.batches.length}묶음`), h("button", {
+			class: "pill",
+			"data-t": "story-backlog-inspect",
+			disabled: loading,
+			onclick: () => loadStoryBacklogPlan(state)
+		}, loading ? "확인 중…" : "다시 확인")) : null, !running && state.storyIn !== false ? selection : null, view.storyBacklogError ? h("div", {
+			class: "notice",
+			role: "alert"
+		}, view.storyBacklogError) : null);
+	}
+	function noticeVisible(state) {
+		return state.enabled && state.storyIn !== false && ["room", "list"].includes(view.screen) && ![...busyRooms].some((k) => k.startsWith(view.key + "|")) && !view.viewer && !view.chatDelete;
+	}
+	function storyBacklogNotice(state) {
+		const key = view.key, notice = state.storyBacklogNotice;
+		if (!noticeVisible(state) || notice?.status !== "pending" || storyBacklogJobs.get(key)?.status === "running") return null;
+		const saving = view.storyBacklogNoticeSaving === key;
+		return h("div", {
+			class: "notice flush",
+			"data-t": "story-backlog-notice",
+			role: "status"
+		}, h("div", {}, `아직 정리하지 않은 과거 줄거리가 ${notice.messageCount}메시지 남아 있어요. 필요하면 범위를 골라 기억에 추가할 수 있어요.`), h("div", { class: "actions flush" }, h("button", {
+			class: "pill primary",
+			"data-t": "story-backlog-notice-open",
+			disabled: saving,
+			onclick: async () => {
+				if (!await chooseStoryBacklogNotice(state, "opened") || view.key !== key) return;
+				view.storyBacklogDialog = key;
+				render();
+				await loadStoryBacklogPlan(state);
+			}
+		}, "범위 확인"), h("button", {
+			class: "pill",
+			"data-t": "story-backlog-notice-later",
+			disabled: saving,
+			onclick: () => chooseStoryBacklogNotice(state, "later")
+		}, "나중에")), view.storyBacklogError ? h("div", {
+			class: "sub",
+			role: "alert"
+		}, view.storyBacklogError) : null);
+	}
+	function storyBacklogDialog(state) {
+		if (view.storyBacklogDialog !== view.key || !noticeVisible(state)) return null;
+		return h("div", {
+			class: "crop-overlay",
+			"data-t": "story-backlog-dialog"
+		}, h("div", {
+			class: "crop-panel backlog-dialog",
+			role: "dialog",
+			"aria-modal": "true",
+			"aria-label": "과거 줄거리 정리"
+		}, h("div", { class: "backlog-heading" }, h("h2", {}, "과거 줄거리 정리"), h("button", {
+			class: "pill",
+			"data-t": "story-backlog-dialog-close",
+			onclick: () => {
+				view.storyBacklogDialog = "";
+				render();
+			}
+		}, "닫기")), storyBacklogCard(state, { dialog: true })));
+	}
+
+//#endregion
 //#region src/ui/floating-button.js
 	const SIZE = 48;
 	const EDGE = 8;
@@ -1792,6 +2875,219 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 //#region src/ui/icons.js
 	const ICON_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><defs><linearGradient id=\"c\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0\" stop-color=\"#FF5C87\"/><stop offset=\"1\" stop-color=\"#B5179E\"/></linearGradient></defs><rect x=\"2\" y=\"2\" width=\"60\" height=\"60\" rx=\"15\" fill=\"url(#c)\"/><rect x=\"9\" y=\"11\" width=\"46\" height=\"5\" rx=\"2.5\" fill=\"#fff\"/><path d=\"M12 16h19c0 13-5 24-14 29h-5zM52 16H33c0 13 5 24 14 29h5z\" fill=\"#fff\"/><rect x=\"11\" y=\"47\" width=\"42\" height=\"4\" rx=\"2\" fill=\"#fff\" opacity=\".85\"/></svg>";
 	const ICON_URI = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(ICON_SVG);
+
+//#endregion
+//#region src/photo/profile-image.js
+	const isProfileRef = (value) => typeof value === "string" && value.startsWith(PROFILE_REF);
+	function pictureId(data) {
+		let h = 5381;
+		for (let i = 0; i < data.length; i++) h = h * 33 + data.charCodeAt(i) | 0;
+		return "h" + (h >>> 0).toString(36) + data.length.toString(36);
+	}
+	const indexKey = (botId) => PROFILE_INDEX_PREFIX + encodeURIComponent(botId);
+	async function keptIndex(botId) {
+		if (!botId) return {};
+		let saved = null;
+		try {
+			saved = await readJson(indexKey(botId));
+		} catch {
+			saved = null;
+		}
+		return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+	}
+	async function thumbOf(data) {
+		try {
+			const img = new Image();
+			img.src = data;
+			await img.decode();
+			const side = 160, scale = side / Math.min(img.naturalWidth, img.naturalHeight);
+			const canvas = document.createElement("canvas");
+			canvas.width = canvas.height = side;
+			const g = canvas.getContext("2d");
+			g.imageSmoothingQuality = "high";
+			g.drawImage(img, (side - img.naturalWidth * scale) / 2, (side - img.naturalHeight * scale) / 2, img.naturalWidth * scale, img.naturalHeight * scale);
+			return canvas.toDataURL("image/webp", .8);
+		} catch {
+			return "";
+		}
+	}
+	async function keepProfileImage(source, info = {}) {
+		if (typeof source !== "string" || !source.startsWith("data:")) return source;
+		const id = pictureId(source);
+		if (typeof await risuai.pluginStorage.getItem(PROFILE_IMAGE_PREFIX + id) !== "string") await risuai.pluginStorage.setItem(PROFILE_IMAGE_PREFIX + id, source);
+		if (info.botId) {
+			const index = await keptIndex(info.botId);
+			if (!index[id]) {
+				const thumb = await thumbOf(source);
+				if (thumb) await risuai.pluginStorage.setItem(PROFILE_THUMB_PREFIX + id, thumb);
+				index[id] = {
+					person: info.contact ? personKey(info.contact) : "",
+					name: info.contact?.name || "",
+					t: Date.now(),
+					size: source.length
+				};
+				await risuai.pluginStorage.setItem(indexKey(info.botId), JSON.stringify(index));
+			}
+		}
+		return PROFILE_REF + id;
+	}
+	async function pickedProfile(source, crop, info = {}) {
+		const image = await keepProfileImage(source, info);
+		return {
+			image,
+			imageCrop: crop ? {
+				...crop,
+				source: image
+			} : undefined,
+			manualImage: true,
+			imageT: Date.now()
+		};
+	}
+	const sharedKey = (botId, contact) => SHARED_PROFILE_PREFIX + encodeURIComponent(botId) + ":" + encodeURIComponent(personKey(contact));
+	async function recordSharedProfile(botId, contact) {
+		if (!botId || !contact?.image || !contact.manualImage) return;
+		const crop = contact.imageCrop && contact.imageCrop.source === contact.image ? {
+			x: contact.imageCrop.x,
+			y: contact.imageCrop.y,
+			zoom: contact.imageCrop.zoom
+		} : null;
+		try {
+			await risuai.pluginStorage.setItem(sharedKey(botId, contact), JSON.stringify({
+				schema: 1,
+				image: contact.image,
+				crop,
+				t: contact.imageT || Date.now()
+			}));
+		} catch (e) {
+			console.log("[interlude] shared profile save failed: " + e.message);
+		}
+	}
+	async function sharedProfile(botId, contact) {
+		if (!botId) return null;
+		let saved = null;
+		try {
+			saved = await readJson(sharedKey(botId, contact));
+		} catch {
+			saved = null;
+		}
+		return saved?.schema === 1 && typeof saved.image === "string" && saved.image ? saved : null;
+	}
+	async function applySharedProfile(botId, contact) {
+		if (!botId || contact.manualImage) return false;
+		const saved = await sharedProfile(botId, contact);
+		if (!saved) return false;
+		contact.image = saved.image;
+		if (saved.crop) contact.imageCrop = {
+			...saved.crop,
+			source: saved.image
+		};
+		else delete contact.imageCrop;
+		contact.manualImage = true;
+		contact.imageFrom = "shared";
+		return true;
+	}
+	function referenceGenerations(state) {
+		const photos = [...(state?.contacts || []).flatMap((c) => c.profileShots || []), ...(state?.rooms || []).flatMap((r) => (r.msgs || []).flatMap((m) => m.photo ? [m.photo] : []))];
+		return photos.flatMap((p) => [p.generation, p.promptOverride].filter(Boolean));
+	}
+	async function keptUsage(ctx, key, state) {
+		const botId = ctx?.char?.chaId;
+		const use = new Map();
+		const mark = (ref, what) => {
+			if (!use.has(ref)) use.set(ref, new Set());
+			use.get(ref).add(what);
+		};
+		if (!botId) return use;
+		const known = new Set(await risuai.pluginStorage.keys() || []);
+		const chats = ctx.char.chats || [];
+		for (let i = 0; i < chats.length; i++) {
+			const chatKey = STORE_PREFIX + botId + ":" + (chats[i].id || "idx" + i);
+			const st = chatKey === key ? state : states.get(chatKey) || (known.has(chatKey) ? await readJson(chatKey) : null);
+			const where = chatKey === key ? "here" : "other";
+			for (const c of Array.isArray(st?.contacts) ? st.contacts : []) {
+				if (isProfileRef(c.image)) mark(c.image, where);
+				if (isProfileRef(c.photoReference?.image)) mark(c.photoReference.image, where);
+			}
+			for (const g of referenceGenerations(st)) for (const r of g.references || []) if (isProfileRef(r.image)) mark(r.image, where);
+		}
+		const prefix = SHARED_PROFILE_PREFIX + encodeURIComponent(botId) + ":";
+		for (const k of known) {
+			if (typeof k !== "string" || !k.startsWith(prefix)) continue;
+			const saved = await readJson(k);
+			if (isProfileRef(saved?.image)) mark(saved.image, "shared");
+		}
+		return use;
+	}
+	async function deleteKept(ctx, key, state, ids) {
+		const botId = ctx?.char?.chaId;
+		if (!botId || !ids.length) return 0;
+		const refs = new Set(ids.map((id) => PROFILE_REF + id));
+		const known = new Set(await risuai.pluginStorage.keys() || []);
+		let people = 0;
+		const clear = (st) => {
+			let n = 0, changed = false;
+			for (const c of Array.isArray(st?.contacts) ? st.contacts : []) {
+				if (refs.has(c.photoReference?.image)) {
+					delete c.photoReference.image;
+					changed = true;
+				}
+				if (!refs.has(c.image)) continue;
+				c.image = "";
+				c.manualImage = false;
+				delete c.imageCrop;
+				delete c.imageFrom;
+				delete c.imageT;
+				n++;
+				changed = true;
+			}
+			for (const g of referenceGenerations(st)) if (Array.isArray(g.references)) {
+				const kept = g.references.filter((r) => !refs.has(r.image));
+				if (kept.length !== g.references.length) {
+					g.references = kept;
+					changed = true;
+				}
+			}
+			return {
+				n,
+				changed
+			};
+		};
+		const chats = ctx.char.chats || [];
+		for (let i = 0; i < chats.length; i++) {
+			const chatKey = STORE_PREFIX + botId + ":" + (chats[i].id || "idx" + i);
+			const live = chatKey === key ? state : states.get(chatKey);
+			if (live) {
+				const { n, changed } = clear(live);
+				if (changed) {
+					people += n;
+					await saveState(chatKey);
+				}
+				continue;
+			}
+			if (!known.has(chatKey)) continue;
+			const st = await readJson(chatKey);
+			const { n, changed } = clear(st);
+			if (changed) {
+				people += n;
+				await risuai.pluginStorage.setItem(chatKey, JSON.stringify(st));
+			}
+		}
+		const prefix = SHARED_PROFILE_PREFIX + encodeURIComponent(botId) + ":";
+		for (const k of known) {
+			if (typeof k !== "string" || !k.startsWith(prefix)) continue;
+			const saved = await readJson(k);
+			if (refs.has(saved?.image)) await risuai.pluginStorage.removeItem(k);
+		}
+		const index = await keptIndex(botId);
+		for (const id of ids) {
+			await risuai.pluginStorage.removeItem(PROFILE_IMAGE_PREFIX + id);
+			await risuai.pluginStorage.removeItem(PROFILE_THUMB_PREFIX + id);
+			forgetImageUrl(PROFILE_REF + id);
+			delete index[id];
+		}
+		await risuai.pluginStorage.setItem(indexKey(botId), JSON.stringify(index));
+		return people;
+	}
 
 //#endregion
 //#region src/ui/screens/photos.js
@@ -1976,24 +3272,26 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		await saveState(view.key);
 	}
 	async function usePhotoAsProfile(state, item, url) {
-		const contact = item.profileOf || state.contacts.find((c) => c.id === item.msg.from);
+		const contact = item.foreign ? item.target : item.profileOf || state.contacts.find((c) => c.id === item.msg.from);
 		if (!contact) return;
-		const key = view.key, source = url || await photoFull(item.msg.photo.id);
+		const key = view.key, source = item.msg.photo.id && await photoOriginal(item.msg.photo.id) || url;
 		if (view.key !== key || !source) return;
 		const crop = await editProfileCrop(source, contact.imageCrop);
 		if (!crop || view.key !== key) return;
 		const old = {
 			image: contact.image,
 			imageCrop: contact.imageCrop,
-			manualImage: contact.manualImage
+			manualImage: contact.manualImage,
+			imageT: contact.imageT,
+			imageFrom: contact.imageFrom
 		};
-		Object.assign(contact, {
-			image: source,
-			imageCrop: crop,
-			manualImage: true
-		});
+		Object.assign(contact, await pickedProfile(source, crop, {
+			botId: view.ctx?.char?.chaId,
+			contact
+		}), { imageFrom: undefined });
 		try {
 			await saveState(key);
+			await recordSharedProfile(view.ctx?.char?.chaId, contact);
 		} catch {
 			Object.assign(contact, old);
 			view.notice = "프로필 사진을 저장하지 못했어요.";
@@ -2004,7 +3302,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 	function photoGenerationDetails(photo) {
 		const g = photo.generation;
 		const field = (label, value) => h("div", {}, h("strong", {}, label), h("pre", {}, value || "(없음)"));
-		if (g?.schema === 1) return h("div", { "data-t": "photo-used-tags" }, field("모델 · 크기 · 시드", `${g.model} · ${g.width}×${g.height} · ${g.seed}`), field("공통 태그 (그림체 + 장면)", g.base), ...(g.chars || []).map((tags, i) => field(`인물 태그 · ${g.people?.[i]?.name || i + 1}`, tags)), field("네거티브 태그", g.negative), ...(g.charNegatives || []).map((tags, i) => tags ? field(`인물 네거티브 · ${g.people?.[i]?.name || i + 1}`, tags) : null).filter(Boolean), ...g.avoidCovering?.length ? [field("모델이 선택한 가림 억제 태그 (적용됨)", g.avoidCovering.join(", "))] : []);
+		if (g?.schema === 1) return h("div", { "data-t": "photo-used-tags" }, field("모델 · 크기 · 시드", `${g.model} · ${g.width}×${g.height} · ${g.seed}`), ...g.references?.length ? [field("사용한 레퍼런스", g.references.map((r) => `${g.people?.find((p) => p.id === r.who)?.name || "인물"} · ${r.type === "style" ? "그림체" : r.type === "character&style" ? "인물과 그림체" : "인물"} · 강도 ${r.strength} · 충실도 ${r.fidelity}`).join("\n"))] : [], field("공통 태그 (그림체 + 장면)", g.base), ...(g.chars || []).map((tags, i) => field(`인물 태그 · ${g.people?.[i]?.name || i + 1}`, tags)), field("네거티브 태그", g.negative), ...(g.charNegatives || []).map((tags, i) => tags ? field(`인물 네거티브 · ${g.people?.[i]?.name || i + 1}`, tags) : null).filter(Boolean), ...g.avoidCovering?.length ? [field("모델이 선택한 가림 억제 태그 (적용됨)", g.avoidCovering.join(", "))] : []);
 		return h("div", { "data-t": "photo-used-tags-missing" }, h("p", {}, "이전 사진에는 실제 생성에 사용한 전체 태그가 저장되어 있지 않아요. 아래는 메시지에 남아 있는 요청 태그예요."), field("요청 장면 태그", photo.tags), field("요청 의상 태그", photoOutfit(photo)));
 	}
 	async function savePhotoPrompt(key, roomId, msgId, photoId, draft) {
@@ -2156,7 +3454,8 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			view.viewer = null;
 			return null;
 		}
-		const sender = state.contacts.find((c) => c.id === item.msg.from);
+		const foreign = !!item.foreign;
+		const sender = foreign ? item.target : state.contacts.find((c) => c.id === item.msg.from);
 		const img = h("img", {
 			alt: "",
 			"data-t": "viewer-img"
@@ -2214,7 +3513,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			"aria-label": "닫기",
 			"data-t": "viewer-close",
 			onclick: closeViewer
-		}, icon("close", 22)), h("span", { class: "mid" }, h("span", { class: "nm" }, sender?.name || ""), h("span", { class: "st" }, `${new Date(item.msg.t).toLocaleString()}${many ? ` · ${v.index + 1}/${v.items.length}` : ""}`))), h("div", { class: "vbody" }, img, many ? h("button", {
+		}, icon("close", 22)), h("span", { class: "mid" }, h("span", { class: "nm" }, sender?.name || item.who?.[0]?.name || ""), h("span", { class: "st" }, `${foreign ? item.chatName + " · " : ""}${new Date(item.msg.t).toLocaleString()}${many ? ` · ${v.index + 1}/${v.items.length}` : ""}`))), h("div", { class: "vbody" }, img, many ? h("button", {
 			class: "vnav l",
 			"aria-label": "이전 사진",
 			"data-t": "viewer-prev",
@@ -2236,14 +3535,14 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "vdetails",
 			"data-t": "photo-details",
 			open: !!v.editPrompt || !!v.promptNotice
-		}, h("summary", {}, "이미지 상세 · 사용 태그"), photoGenerationDetails(item.msg.photo), photoPromptEditor(item, v)), h("div", { class: "vacts" }, h("button", {
+		}, h("summary", {}, "이미지 상세 · 사용 태그"), photoGenerationDetails(item.msg.photo), foreign ? null : photoPromptEditor(item, v)), h("div", { class: "vacts" }, h("button", {
 			class: "vbtn",
 			"data-t": "viewer-download",
 			onclick: async () => {
 				const url = v.fullId === item.msg.photo.id && v.full ? v.full : await photoFull(item.msg.photo.id);
 				if (url) saveBlob(photoFileName(state, item), new Blob([dataUrlBytes(url)], { type: "image/webp" }));
 			}
-		}, icon("download", 22), h("span", {}, "저장")), item.room ? h("button", {
+		}, icon("download", 22), h("span", {}, "저장")), item.room && !foreign ? h("button", {
 			class: "vbtn",
 			"data-t": "viewer-redraw",
 			disabled: !!v.redrawing || !!v.editPrompt?.saving,
@@ -2255,9 +3554,77 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				await usePhotoAsProfile(state, item, v.fullId === item.msg.photo.id ? v.full : "");
 				closeViewer();
 			}
-		}, avatar(sender, 22), h("span", {}, "프로필로")) : null, del));
+		}, avatar(sender, 22), h("span", {}, "프로필로")) : null, foreign ? null : del));
+	}
+	async function loadBotPhotos(state) {
+		const ctx = view.ctx, key = view.key;
+		const chats = ctx?.char?.chats || [];
+		const known = new Set(await risuai.pluginStorage.keys() || []);
+		const items = [];
+		for (let i = 0; i < chats.length; i++) {
+			const chatKey = STORE_PREFIX + ctx.char.chaId + ":" + (chats[i].id || "idx" + i);
+			const own = chatKey === key;
+			const other = own ? state : known.has(chatKey) ? await readJson(chatKey) : null;
+			if (!other || !Array.isArray(other.rooms) || !Array.isArray(other.contacts)) continue;
+			const chatName = String(chats[i].name || `채팅 ${i + 1}`);
+			for (const item of photosOf(other)) {
+				const sender = other.contacts.find((c) => c.id === item.msg.from);
+				const persons = [...new Set([item.msg.from, ...item.msg.photo.who || []])].map((id) => other.contacts.find((c) => c.id === id)).filter(Boolean);
+				const target = own ? null : sender ? state.contacts.find((c) => personKey(c) === personKey(sender)) || null : null;
+				items.push({
+					...item,
+					chatKey,
+					chatName,
+					foreign: !own,
+					target,
+					who: persons.map((p) => ({
+						key: personKey(p),
+						name: p.name
+					}))
+				});
+			}
+		}
+		return items.sort((a, b) => (b.msg.t || 0) - (a.msg.t || 0));
+	}
+	function botPhotos(state) {
+		const key = view.key;
+		if (view.allPhotos?.key !== key) {
+			const entry = view.allPhotos = {
+				key,
+				items: null,
+				error: ""
+			};
+			loadBotPhotos(state).then((items) => {
+				if (view.allPhotos === entry) {
+					entry.items = items;
+					render();
+				}
+			}, (e) => {
+				if (view.allPhotos === entry) {
+					entry.error = e.message;
+					render();
+				}
+			});
+		}
+		return view.allPhotos;
 	}
 	function galleryBody(state) {
+		const scopeChip = (scope, label) => h("button", {
+			class: "pill" + ((view.galleryScope || "chat") === scope ? " primary" : ""),
+			"data-t": "gallery-scope",
+			"data-scope": scope,
+			onclick: () => {
+				view.galleryScope = scope;
+				if (scope === "all") view.allPhotos = null;
+				render();
+			}
+		}, label);
+		const manyChats = (view.ctx?.char?.chats?.length || 0) > 1;
+		const scopes = manyChats ? h("div", {
+			class: "chips",
+			"data-t": "gallery-scopes"
+		}, scopeChip("chat", "이 챗"), scopeChip("all", "모든 챗")) : null;
+		if (manyChats && view.galleryScope === "all") return allChatsGallery(state, scopes);
 		const all = photosOf(state);
 		const people = state.contacts.filter((c) => all.some((x) => x.msg.from === c.id || (x.msg.photo.who || []).includes(c.id)));
 		const who = people.some((c) => c.id === view.galleryWho) ? view.galleryWho : "";
@@ -2266,6 +3633,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "scroll",
 			id: "scroll"
 		});
+		if (scopes) body.append(scopes);
 		if (view.notice) body.append(h("div", {
 			class: "notice",
 			"data-t": "notice"
@@ -2302,6 +3670,181 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		}, list.map((item, i) => thumbButton(item, () => openViewer(list.slice(), i), "gitem"))));
 		return body;
 	}
+	function allChatsGallery(state, scopes) {
+		const body = h("div", {
+			class: "scroll",
+			id: "scroll"
+		}, scopes);
+		if (view.notice) body.append(h("div", {
+			class: "notice",
+			"data-t": "notice"
+		}, view.notice));
+		const entry = botPhotos(state);
+		if (entry.error) {
+			body.append(h("div", {
+				class: "notice",
+				role: "alert",
+				"data-t": "gallery-all-error"
+			}, "다른 채팅의 사진을 불러오지 못했어요. " + entry.error));
+			return body;
+		}
+		if (!entry.items) {
+			body.append(h("div", { class: "hello" }, h("div", {
+				class: "meta",
+				"data-t": "gallery-all-loading"
+			}, h("span", { class: "spin small" }), " 이 봇의 모든 채팅에서 사진을 모으는 중…")));
+			return body;
+		}
+		const items = entry.items;
+		if (!items.length) {
+			body.append(h("div", { class: "hello" }, h("div", {
+				class: "meta",
+				"data-t": "gallery-empty"
+			}, "이 봇의 채팅에 받은 사진이 없어요.")));
+			return body;
+		}
+		const names = new Map();
+		for (const item of items) for (const p of item.who) if (!names.has(p.key)) names.set(p.key, p.name);
+		const who = names.has(view.galleryWhoKey) ? view.galleryWhoKey : "";
+		const list = who ? items.filter((item) => item.who.some((p) => p.key === who)) : items;
+		const chip = (key, label) => h("button", {
+			class: "pill" + (who === key ? " primary" : ""),
+			"data-t": "gallery-filter",
+			"data-name": label,
+			onclick: () => {
+				view.galleryWhoKey = key;
+				render();
+			}
+		}, label);
+		body.append(h("div", { class: "chips" }, chip("", "전체"), [...names].map(([key, name]) => chip(key, name))), h("div", { class: "sub" }, `${new Set(list.map((i) => i.chatKey)).size}개 채팅 · ${list.length}장. 다른 채팅의 사진은 보기와 "프로필로"만 할 수 있고, 삭제는 그 채팅에서 해요.`), h("div", {
+			class: "gal",
+			"data-t": "gallery"
+		}, list.map((item, i) => {
+			const btn = thumbButton(item, () => openViewer(list.slice(), i), "gitem");
+			if (item.foreign) {
+				btn.dataset.foreign = "1";
+				btn.title = item.chatName;
+			}
+			return btn;
+		})));
+		return body;
+	}
+
+//#endregion
+//#region src/photo/reference.js
+	const REFERENCE_TYPES = [
+		["character", "인물"],
+		["character&style", "인물과 그림체"],
+		["style", "그림체"]
+	];
+	const value = (n, fallback) => typeof n === "number" && Number.isFinite(n) ? n : fallback;
+	function referenceSettings(raw = {}, defaults = {}) {
+		return {
+			enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaults.enabled === true,
+			type: REFERENCE_TYPES.some(([t]) => t === raw.type) ? raw.type : REFERENCE_TYPES.some(([t]) => t === defaults.type) ? defaults.type : "character",
+			strength: value(raw.strength, value(defaults.strength, .6)),
+			fidelity: value(raw.fidelity, value(defaults.fidelity, 1)),
+			...typeof raw.image === "string" && raw.image ? { image: raw.image } : {}
+		};
+	}
+	function photoReferencePlan(people, defaults, model) {
+		if (!/^nai-diffusion-4-5(?:-|$)/.test(model || "")) return [];
+		return people.flatMap((p) => {
+			const ref = referenceSettings(p.photoReference, defaults);
+			const image = ref.image || p.image;
+			return ref.enabled && image ? [{
+				who: p.id,
+				image,
+				type: ref.type,
+				strength: ref.strength,
+				fidelity: ref.fidelity
+			}] : [];
+		});
+	}
+	async function referenceImageData(source) {
+		const url = await imageUrl(source);
+		if (!url) throw new Error("레퍼런스 이미지를 읽지 못했어요. 프로필에서 이미지를 다시 골라 주세요.");
+		const img = new Image();
+		img.src = url;
+		await img.decode();
+		const ratio = img.naturalWidth / img.naturalHeight;
+		const [w, h] = [
+			[1024, 1536],
+			[1472, 1472],
+			[1536, 1024]
+		].sort((a, b) => Math.abs(Math.log(ratio / (a[0] / a[1]))) - Math.abs(Math.log(ratio / (b[0] / b[1]))))[0];
+		const canvas = document.createElement("canvas");
+		canvas.width = w;
+		canvas.height = h;
+		const g = canvas.getContext("2d");
+		g.fillStyle = "#000";
+		g.fillRect(0, 0, w, h);
+		const scale = Math.min(w / img.naturalWidth, h / img.naturalHeight);
+		const dw = img.naturalWidth * scale, dh = img.naturalHeight * scale;
+		g.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+		return canvas.toDataURL("image/png").split(",")[1];
+	}
+	function photoReferenceParameters(rows) {
+		if (!rows.length) return {};
+		return {
+			director_reference_images: rows.map((r) => r.data),
+			director_reference_strength_values: rows.map((r) => r.strength),
+			director_reference_secondary_strength_values: rows.map((r) => 1 - r.fidelity),
+			director_reference_descriptions: rows.map((r) => ({
+				caption: {
+					base_caption: r.type,
+					char_captions: []
+				},
+				legacy_uc: false
+			})),
+			director_reference_information_extracted: rows.map(() => 1),
+			controlnet_strength: 1,
+			inpaintImg2ImgStrength: 1,
+			normalize_reference_strength_multiple: true
+		};
+	}
+
+//#endregion
+//#region src/ui/reference-controls.js
+	function referenceControls(raw, defaults, save, own = false) {
+		const cfg = referenceSettings(raw, defaults);
+		const change = (key, value) => {
+			const next = { ...raw || {} };
+			if (value === undefined) delete next[key];
+			else next[key] = value;
+			return save(next);
+		};
+		const select = (key, label, options, current) => h("label", { class: "field flat" }, h("span", { class: "label" }, label), h("select", {
+			"data-t": `reference-${key}`,
+			"aria-label": label,
+			onchange: (e) => change(key, e.target.value === "" ? undefined : key === "enabled" ? e.target.value === "on" : e.target.value)
+		}, options.map(([value, text]) => h("option", {
+			value,
+			selected: current === value
+		}, text))));
+		const number = (key, label) => h("label", { class: "field flat" }, h("span", { class: "label" }, label), h("input", {
+			type: "number",
+			step: "0.05",
+			value: own ? raw?.[key] ?? "" : cfg[key],
+			placeholder: own ? `설정 따름 · ${cfg[key]}` : "",
+			"data-t": `reference-${key}`,
+			"aria-label": label,
+			onchange: (e) => {
+				const v = e.target.value.trim();
+				if (!v && own) change(key, undefined);
+				else if (v && Number.isFinite(Number(v))) change(key, Number(v));
+			}
+		}));
+		return h("div", { "data-t": own ? "person-reference-controls" : "global-reference-controls" }, select("enabled", "레퍼런스 사용", [
+			...own ? [["", `설정 따름 · ${defaults?.enabled ? "켜짐" : "꺼짐"}`]] : [],
+			["on", "켜기"],
+			["off", "끄기"]
+		], own && typeof raw?.enabled !== "boolean" ? "" : cfg.enabled ? "on" : "off"), select("type", "레퍼런스 종류", [...own ? [["", "설정 따름"]] : [], ...REFERENCE_TYPES], own && !raw?.type ? "" : cfg.type), number("strength", "레퍼런스 강도"), number("fidelity", "레퍼런스 충실도"));
+	}
+	const referenceHint = () => h("div", {
+		class: "sub",
+		"data-t": "reference-hint"
+	}, "V4.5에서 적용돼요. 레퍼런스 한 장당 5 Anlas가 추가됩니다. 여러 인물의 레퍼런스를 함께 쓰면 특징이 섞일 수 있어요.");
 
 //#endregion
 //#region src/ui/syslog-screen.js
@@ -2554,8 +4097,42 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 
 //#endregion
 //#region src/ui/screens/picker.js
-	async function startScan() {
+	function estimateText(e) {
+		const noLore = e.noLore ? `로어가 없는 ${e.noLore}명은 분석하지 않아요.` : "";
+		if (!e.calls) return [e.reused ? "저장된 분석을 다시 써서 모델을 부르지 않아요." : "모델을 부르지 않아요.", noLore].filter(Boolean).join(" ");
+		return [
+			`분석에 모델 약 ${e.calls}회, 입력 약 ${e.chars.toLocaleString()}자가 들어요.`,
+			e.reused ? `저장된 분석을 다시 쓰는 ${e.reused}명은 분석 모델을 부르지 않아요.` : "",
+			noLore
+		].filter(Boolean).join(" ");
+	}
+	function fillCost(el, slot, people, force) {
+		const state = states.get(view.key);
+		const sig = [
+			force,
+			view.key,
+			JSON.stringify(contextBudget(state)),
+			...people.map((p) => personKey(p) + "|" + (p.id || ""))
+		].join("\n");
+		let entry = view[slot];
+		if (entry?.sig !== sig) {
+			entry = view[slot] = {
+				sig,
+				text: "분석량을 계산하는 중…"
+			};
+			analysisEstimate(view.ctx, state, people, force).then((e) => {
+				entry.text = estimateText(e);
+			}, () => {
+				entry.text = "분석량을 계산하지 못했어요.";
+			}).finally(() => {
+				if (view[slot] === entry && el.isConnected) el.textContent = entry.text;
+			});
+		}
+		el.textContent = entry.text;
+	}
+	async function startScan(replace = false) {
 		const ctx = view.ctx, key = view.key, state = states.get(key);
+		view.rescanAsk = false;
 		view.scanning = true;
 		view.notice = "";
 		view.scanProgress = "";
@@ -2565,7 +4142,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			const result = await scanCandidates(ctx, state, (done, total) => {
 				view.scanProgress = `${done}/${total}`;
 				refreshJobBar();
-			});
+			}, { replace });
 			await saveState(key);
 			view.pickSelected = null;
 			view.notice = job.stop ? `찾기를 멈췄어요. 지금까지 찾은 ${result.count}명을 보여드려요. 나머지는 다시 찾기로 찾을 수 있어요.` : result.count ? result.failed ? `후보 ${result.count}명을 찾았지만 일부 항목을 읽지 못했습니다. (${result.firstError || "모델 응답 오류"})` : "" : `인물 후보를 찾지 못했습니다.${result.firstError ? ` (${result.firstError})` : ""}`;
@@ -2604,9 +4181,10 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		});
 		const list = pickerList(state);
 		const q = normalize(view.pickQuery);
-		const shown = list.filter((c) => !q || normalize(c.name).includes(q) || (c.aliases || []).some((a) => normalize(a).includes(q)));
+		const shown = list.filter((c) => !has.has(personKey(c)) && (!q || normalize(c.name).includes(q) || (c.aliases || []).some((a) => normalize(a).includes(q))));
 		const open = shown.filter((c) => !has.has(personKey(c)));
-		const costText = (n) => `분석에 입력 약 ${(n * ANALYSIS_TOKENS).toLocaleString()}토큰이 들어요.`;
+		const people = [...state.candidates || [], ...state.contacts];
+		const chosen = () => list.filter((c) => selected.has(personKey(c)) && !has.has(personKey(c))).map((c) => state.contacts.find((old) => resolvedPersonKey(old, people) === personKey(c)) || c);
 		const addBtn = h("button", {
 			class: "pill primary",
 			"data-t": "pick-add",
@@ -2624,7 +4202,8 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "notice",
 			"data-t": "pick-cost",
 			hidden: !selected.size
-		}, costText(selected.size));
+		});
+		if (selected.size) fillCost(cost, "pickCost", chosen(), false);
 		const assets = view.assets || assetList(view.ctx.char);
 		const row = (c) => {
 			const key = personKey(c), added = has.has(key);
@@ -2650,8 +4229,8 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 					delete addBtn.dataset.armed;
 					addBtn.textContent = `${selected.size}명 추가`;
 					addBtn.disabled = !selected.size || !!view.analysis || !!view.bioBusy;
-					cost.textContent = costText(selected.size);
 					cost.hidden = !selected.size;
+					if (selected.size) fillCost(cost, "pickCost", chosen(), false);
 				}
 			}), h("span", { class: "check" }));
 		};
@@ -2685,7 +4264,10 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				class: "pill",
 				"data-t": "pick-rescan",
 				disabled: view.scanning,
-				onclick: startScan
+				onclick: () => {
+					view.rescanAsk = true;
+					render();
+				}
 			}, "다시 찾기")));
 			if (appeared.length) body.append(h("div", { class: "sect" }, "최근 대화에서 이름 확인", h("small", {}, `${appeared.length}명`)), h("div", { class: "rows" }, appeared.map(row)));
 			if (rest.length) body.append(h("div", { class: "sect" }, "로어북 인물", h("small", {}, `${rest.length}명`)), h("div", { class: "rows" }, rest.map(row)));
@@ -2721,9 +4303,31 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			body.append(h("div", { class: "hello" }, h("div", { class: "meta" }, "아직 후보가 없어요."), h("button", {
 				class: "pill",
 				"data-t": "pick-rescan",
-				onclick: startScan
+				onclick: () => startScan()
 			}, "로어북에서 찾기")));
 		}
+		const ask = view.rescanAsk && !view.scanning ? h("div", {
+			class: "crop-overlay",
+			role: "dialog",
+			"aria-modal": "true",
+			"aria-label": "다시 찾기",
+			"data-t": "rescan-dialog"
+		}, h("section", { class: "card dialog-card" }, h("h3", {}, "다시 찾기"), h("p", {}, "기존 후보는 어떻게 할까요? 이미 추가한 사람은 어느 쪽이든 그대로 남아요."), h("div", { class: "actions flush" }, h("button", {
+			class: "pill",
+			"data-t": "rescan-cancel",
+			onclick: () => {
+				view.rescanAsk = false;
+				render();
+			}
+		}, "취소"), h("button", {
+			class: "pill",
+			"data-t": "rescan-add",
+			onclick: () => startScan(false)
+		}, "그냥 다시 찾기"), h("button", {
+			class: "pill primary",
+			"data-t": "rescan-replace",
+			onclick: () => startScan(true)
+		}, "기존 후보 지우고 다시 찾기")))) : null;
 		return [
 			h("div", { class: "top line-b" }, backBtn(() => go("list", { tab: "people" })), h("h1", { class: "small" }, "인물 고르기"), addBtn),
 			h("label", {
@@ -2740,8 +4344,9 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 					render(e.target);
 				}
 			})),
-			body
-		];
+			body,
+			ask
+		].filter(Boolean);
 	}
 	async function addPicked(state, selected) {
 		if (view.analysis || view.bioBusy) return;
@@ -2822,6 +4427,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				c
 			], k = resolvedPersonKey(c, people);
 			if (state.contacts.some((x) => resolvedPersonKey(x, people) === k)) continue;
+			await applySharedProfile(ctx?.char?.chaId, c);
 			state.contacts.push(c);
 			joined = true;
 		}
@@ -2864,7 +4470,10 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 					contact
 				];
 				const key = resolvedPersonKey(contact, people);
-				if (!state.contacts.some((c) => resolvedPersonKey(c, people) === key)) state.contacts.push(contact);
+				if (!state.contacts.some((c) => resolvedPersonKey(c, people) === key)) {
+					await applySharedProfile(ctx?.char?.chaId, contact);
+					if (!state.contacts.some((c) => resolvedPersonKey(c, people) === key)) state.contacts.push(contact);
+				}
 			}
 			job.current.delete(contact.name);
 			if (!ok) {
@@ -3023,7 +4632,6 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		const match = (c) => !q || normalize(c.name).includes(q) || (c.aliases || []).some((a) => normalize(a).includes(q));
 		const busy = !!view.analysis || !!view.bioBusy;
 		const label = () => `${selected.size}명 다시 분석`;
-		const cost = (n) => `모델 약 ${n}회 · 입력 약 ${(n * ANALYSIS_TOKENS).toLocaleString()}토큰이 들어요.`;
 		const runBtn = h("button", {
 			class: "pill primary",
 			"data-t": "reanalyze-run",
@@ -3047,13 +4655,17 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "notice",
 			"data-t": "reanalyze-cost",
 			hidden: !selected.size
-		}, cost(selected.size));
+		});
+		const showCost = () => {
+			if (selected.size) fillCost(costBox, "reanalyzeCost", state.contacts.filter((c) => selected.has(c.id)), true);
+		};
+		showCost();
 		const sync = () => {
 			delete runBtn.dataset.armed;
 			runBtn.textContent = label();
 			runBtn.disabled = !selected.size || busy;
-			costBox.textContent = cost(selected.size);
 			costBox.hidden = !selected.size;
+			showCost();
 		};
 		const row = (c) => {
 			const s = statusOf(c);
@@ -3348,6 +4960,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 //#region src/ui/screens/edit.js
 	async function openEdit(contactId) {
 		if (!view.assets) await gatherAssets(view.ctx);
+		view.editLoreBooks = await loreBooks();
 		go("edit", { contactId });
 	}
 	function readProfileFile(file) {
@@ -3569,7 +5182,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				"data-t": "asset-picker-close",
 				onclick: () => sheet.remove()
 			}, icon("back", 24)), h("h1", { class: "small" }, title)), h("div", { class: "picker-body" }, assetGallery(draft, state, galleryAssets, async (a) => {
-				const source = a.photoId ? await photoFull(a.photoId) : a.path;
+				const source = a.photoId ? await photoOriginal(a.photoId) : a.path;
 				if (!source) return;
 				await selectImage(source);
 				if (draft.image === source) sheet.remove();
@@ -3618,6 +5231,23 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			draft.cardNote = note.querySelector("textarea").value.trim();
 			draft.role = role.querySelector("input").value.trim();
 			draft.userAddress = address.querySelector("input").value.trim().slice(0, 40);
+			const cropOf = (c) => c?.imageCrop ? [
+				c.imageCrop.x,
+				c.imageCrop.y,
+				c.imageCrop.zoom
+			].join() : "";
+			const picked = draft.manualImage && !!draft.image && (draft.image !== (existing?.image || "") || cropOf(draft) !== cropOf(existing));
+			if (picked) {
+				try {
+					Object.assign(draft, await pickedProfile(draft.image, draft.imageCrop, {
+						botId: view.ctx?.char?.chaId,
+						contact: draft
+					}), { imageFrom: undefined });
+				} catch {
+					fileNotice.textContent = "프로필 사진을 저장하지 못했어요. 다시 시도해 주세요.";
+					return;
+				}
+			}
 			const old = existing ? { ...existing } : null;
 			if (existing) {
 				Object.assign(existing, draft);
@@ -3636,9 +5266,30 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				fileNotice.textContent = "프로필을 저장하지 못했어요. 다시 시도해 주세요.";
 				return;
 			}
+			if (picked) await recordSharedProfile(view.ctx?.char?.chaId, existing || draft);
 			leave();
 			if (!existing) analyzeInBackground(state, [draft]);
 		};
+		const books = view.editLoreBooks || [];
+		const linked = new Set(findLoreEntries(draft, books).map(loreEntryRef));
+		const primary = findLoreEntry(draft, books);
+		const loreSelect = h("select", {
+			multiple: true,
+			size: Math.min(6, Math.max(2, books.length)),
+			"data-t": "contact-lore-selection",
+			"aria-label": "연결할 로어북 항목",
+			onchange: (e) => {
+				draft.loreSelection = [...e.target.selectedOptions].map((o) => o.value);
+			}
+		}, books.map((entry) => h("option", {
+			value: loreEntryRef(entry),
+			selected: linked.has(loreEntryRef(entry)),
+			disabled: entry === primary
+		}, `${loreTitle(entry)}${entry === primary ? " (대표 항목)" : ""}`)));
+		const loreConnections = books.length ? h("details", {
+			class: "field",
+			"data-t": "contact-lore-links"
+		}, h("summary", {}, `연결된 로어북 ${linked.size}개`), h("div", { class: "sub" }, "같은 인물의 여러 항목을 함께 분석해요. 대표 항목은 유지하고 추가로 사용할 항목을 고를 수 있어요. 변경 후 다시 분석하면 반영돼요."), loreSelect) : null;
 		return [h("div", { class: "top line-b" }, backBtn(leave), h("h1", { class: "small" }, existing ? "프로필 수정" : "이름으로 분석"), closeBtn()), h("div", {
 			class: "scroll",
 			id: "scroll"
@@ -3647,12 +5298,213 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			"data-t": "contact-save-top",
 			disabled: !existing && (!!view.analysis || !!view.bioBusy),
 			onclick: save
-		}, existing ? "저장" : "분석 후 추가")), name, bio, role, address, note, h("div", { class: "field" }, h("span", { class: "label" }, "프로필 사진"), gallery), h("div", { class: "field" }, file, fileNotice), h("div", { class: "actions" }, h("button", {
+		}, existing ? "저장" : "분석 후 추가")), name, bio, role, address, note, loreConnections, h("div", { class: "field" }, h("span", { class: "label" }, "프로필 사진"), gallery), h("div", { class: "field" }, file, fileNotice), h("div", { class: "actions" }, h("button", {
 			class: "pill primary",
 			"data-t": "contact-save",
 			disabled: !existing && (!!view.analysis || !!view.bioBusy),
 			onclick: save
 		}, existing ? "저장" : "분석 후 추가")))];
+	}
+
+//#endregion
+//#region src/chat/relationship-init.js
+	const relationshipSeeds = new WeakMap();
+	async function relationshipSeedPlan(ctx, state, members, limit) {
+		const main = (ctx.chat.message || []).filter((m) => m.chatId);
+		const positions = new Map(main.map((m, i) => [m.chatId, i]));
+		const originals = new Map(main.map((m) => [m.chatId, relationshipMessage(m)]));
+		const people = state.contacts || [];
+		const relevant = (text) => members.some((m) => mentionEvidence(m, text, people));
+		const rows = [];
+		for (const m of state.storyIn !== false ? main : []) {
+			const text = cleanStory(m.data).split(/\n\s*\n/).filter(relevant).join("\n\n");
+			if (text) rows.push({
+				kind: "story",
+				at: m.chatId,
+				text,
+				full: originals.get(m.chatId),
+				position: positions.get(m.chatId) * 2,
+				order: 0
+			});
+		}
+		const resolve = makeResolver(people), memberIds = new Set(members.map((m) => m.id));
+		for (const event of state.storyIn !== false ? await hypaPlusEvents(ctx, new Set()) : []) {
+			const owned = event.who.some((name) => memberIds.has(resolve(name, event.who, () => event.text)));
+			if (!owned && !relevant(event.text)) continue;
+			const sourceIds = (event.src || []).filter((id) => positions.has(id));
+			const at = sourceIds.sort((a, b) => positions.get(a) - positions.get(b)).at(-1);
+			if (!at) continue;
+			rows.push({
+				kind: "story",
+				at,
+				text: event.text,
+				full: originals.get(at),
+				position: positions.get(at) * 2,
+				order: 0,
+				summary: true
+			});
+		}
+		for (const room of state.rooms || []) {
+			if (!members.some((m) => room.members?.includes(m.id) || room.as === m.id)) continue;
+			for (const m of room.msgs || []) {
+				if (m.failed || !m.text) continue;
+				const who = m.from === "me" ? "사용자" : people.find((p) => p.id === m.from)?.name || m.from;
+				rows.push({
+					kind: "chat",
+					roomId: room.id,
+					at: m.id,
+					text: `${who}: ${m.text}`,
+					full: String(m.text),
+					position: (positions.get(m.relationshipAnchor?.id) ?? m.relationshipAnchor?.index ?? -1) * 2 + 1,
+					order: m.t || 0,
+					anchor: m.relationshipAnchor
+				});
+			}
+		}
+		const picked = [], seen = new Set();
+		let left = Math.max(0, limit);
+		for (const row of rows.sort((a, b) => b.position - a.position || b.order - a.order)) {
+			const identity = JSON.stringify([
+				row.kind,
+				row.roomId,
+				row.at,
+				row.text
+			]);
+			if (seen.has(identity)) continue;
+			const label = `[message:${row.at}]${row.summary ? " [본편 요약]" : ""}`;
+			let text = row.text;
+			if (!picked.length && text.length + label.length + 2 > left) text = text.slice(-Math.max(0, left - label.length - 2));
+			const size = text.length + label.length + 2;
+			if (!text || size > left) continue;
+			seen.add(identity);
+			picked.push({
+				...row,
+				text,
+				label
+			});
+			left -= size;
+		}
+		picked.sort((a, b) => a.position - b.position || a.order - b.order);
+		return {
+			rows: picked,
+			usedChars: Math.max(0, limit) - left,
+			limit
+		};
+	}
+	async function initializeRelationshipBatch(ctx, state, members, pcName) {
+		const plan = await relationshipSeedPlan(ctx, state, members, contextBudget(state).analysis);
+		if (!plan.rows.length) {
+			for (const c of members) c.relationshipSeed = {
+				schema: 1,
+				empty: true
+			};
+			return {
+				changed: 0,
+				called: false
+			};
+		}
+		const facts = members.map((c) => `## ${c.name}\n${[c.cardNote || "", ...(c.memory || []).filter((m) => m.type === "fact" || m.by === "user").map((m) => m.text)].filter(Boolean).join("\n")}`).join("\n\n");
+		const prompt = `[현재 관계 초기화]
+기존 RP의 사건과 메신저 기록에서 인물별 현재 관계·감정·유효한 약속을 정리한다. 사건을 이어 쓰지 않고 현재 상태 데이터를 작성한다.
+사용자: ${pcName} (target me)
+인물: ${members.map((c) => c.name).join(", ")}
+인물 ID: ${members.map((c) => `${c.name}=${c.id}`).join(", ")}
+상대 이름: ${(state.contacts || []).map((c) => c.name).join(", ")}
+${relationshipInstructions}
+전체 근거를 오래된 순으로 읽고 상대별 마지막 유효한 상태를 쓴다. 과거에 성립한 관계는 이후 바뀐 근거가 없으면 유지한다. 최근 문단에 나오지 않는다는 이유로 예전 기본 설정으로 되돌리지 않는다.
+history에는 그 관계가 된 경위와 주요 사건을 쓴다. relation에는 지금 어떤 사이인지만 한두 문장으로 쓴다. 경위, 마지막 장면의 행동, 무엇을 하다 잠들었는지 같은 사건 서술은 history에 쓰고 relation에 넣지 않는다.
+promises는 근거에서 확인된 약속이 있을 때만 쓴다. 약속 근거가 없으면 promises 칸을 생략하고, 있던 약속이 모두 끝났을 때만 promises:[]로 쓴다.
+상태가 불명확하면 지어내지 않고 해당 항목을 생략한다. 관계 근거가 없으면 relationships:[]다. 다른 인물의 상태를 옮기지 않는다. who는 위 인물의 이름 또는 ID, target은 me 또는 상대 이름/ID, at은 상태 근거의 message ID다.
+JSON 하나: {"people":[{"who":"인물 이름 또는 ID","relationships":[{"target":"me","at":"근거 message ID","history":"그 관계가 된 경위와 주요 사건","relation":"지금 어떤 사이인지 (경위·행동 제외)","feeling":"그 상대에 대한 현재 감정","promises":["확인된 유효한 약속 (없으면 칸 생략)"]}]}]}
+
+[설정 메모리 - 사용자가 확정한 사실 우선]
+${facts}
+
+[근거 - 오래된 순]
+${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
+		const raw = parseCard(await askModel([{
+			role: "user",
+			content: prompt
+		}], null, "relationship-init"));
+		if (!Array.isArray(raw?.people)) throw new Error("현재 관계 초기화 응답을 해석하지 못했어요.");
+		const latest = Number.isInteger(ctx.charIndex) && Number.isInteger(ctx.chatIndex) ? await risuai.getChatFromIndex(ctx.charIndex, ctx.chatIndex) : ctx.chat;
+		if (!latest || latest.id !== ctx.chat.id) throw new Error("챗이 바뀌어 현재 관계를 저장하지 않았어요.");
+		const after = await relationshipSeedPlan({
+			...ctx,
+			chat: latest
+		}, state, members, plan.limit);
+		if (JSON.stringify(after.rows) !== JSON.stringify(plan.rows)) throw new Error("정리 중 근거가 바뀌어 현재 관계를 저장하지 않았어요.");
+		const resolve = makeResolver(state.contacts || []);
+		let changed = 0;
+		const missing = [], observedSeq = Date.now();
+		for (const c of members) {
+			const hit = raw.people.find((p) => p?.who === c.id || typeof p?.who === "string" && resolve(p.who) === c.id);
+			if (!Array.isArray(hit?.relationships)) {
+				missing.push(c.name);
+				continue;
+			}
+			let invalid = false;
+			const revision = (c.relationshipHistory?.length || 0) + 1;
+			for (const update of hit.relationships) {
+				const row = plan.rows.find((r) => r.at === update?.at);
+				const target = update?.target;
+				const knownTarget = typeof target === "string" && (target === "me" || normalize(target) === normalize(pcName) || state.contacts.some((p) => p.id === target) || resolve(target));
+				if (!row || !knownTarget || !Object.keys(relationshipPatch(update)).length) {
+					invalid = true;
+					continue;
+				}
+				changed += applyRelationships(state, [{
+					...update,
+					who: c.id
+				}], {
+					kind: row.kind,
+					roomId: row.roomId,
+					messages: [{
+						id: row.at,
+						text: row.full,
+						anchor: row.anchor,
+						order: row.order
+					}],
+					members: [c.id],
+					observedAt: latest.message?.at(-1)?.chatId || "",
+					observedSeq,
+					revision
+				}, pcName);
+			}
+			if (invalid) {
+				missing.push(c.name);
+				continue;
+			}
+			c.relationshipSeed = { schema: 1 };
+		}
+		if (missing.length) throw new Error(`${missing.join(", ")}의 현재 관계를 받지 못했어요.`);
+		return {
+			changed,
+			called: true,
+			inputChars: plan.usedChars
+		};
+	}
+	async function initializeRelationships(ctx, state, members, pcName, { force = false } = {}) {
+		let jobs = relationshipSeeds.get(state);
+		if (!jobs) relationshipSeeds.set(state, jobs = new Map());
+		const needed = members.filter((c) => force || c.relationshipSeed?.schema !== 1);
+		const fresh = needed.filter((c) => !jobs.has(c.id));
+		if (fresh.length) {
+			const task = initializeRelationshipBatch(ctx, state, fresh, pcName).finally(() => {
+				for (const c of fresh) if (jobs.get(c.id) === task) jobs.delete(c.id);
+			});
+			for (const c of fresh) jobs.set(c.id, task);
+		}
+		const pending = [...new Set(needed.map((c) => jobs.get(c.id)).filter(Boolean))];
+		if (!pending.length) return {
+			changed: 0,
+			called: false
+		};
+		const results = await Promise.all(pending);
+		return {
+			changed: results.reduce((n, r) => n + r.changed, 0),
+			called: results.some((r) => r.called)
+		};
 	}
 
 //#endregion
@@ -3726,7 +5578,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		const present = inStory(c);
 		const head = h("div", { class: "top line-b" }, backBtn(() => go(view.profileFrom === "room" ? "room" : "list")), h("h1", { class: "small" }, c.name), closeBtn());
 		const cover = h("div", { class: "cover" });
-		if (c.image) lazily(cover, () => profileImageUrl(c).then((url) => {
+		if (c.image) lazily(cover, () => profileImageUrl(c, shownPixels(document.getElementById("win")?.clientWidth || 480)).then((url) => {
 			if (url) cover.append(h("img", {
 				src: url,
 				alt: ""
@@ -3743,15 +5595,17 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 					const old = {
 						image: c.image,
 						imageCrop: c.imageCrop,
-						manualImage: c.manualImage
+						manualImage: c.manualImage,
+						imageT: c.imageT,
+						imageFrom: c.imageFrom
 					};
-					Object.assign(c, {
-						image: a.path,
-						imageCrop: crop,
-						manualImage: true
-					});
+					Object.assign(c, await pickedProfile(a.path, crop, {
+						botId: view.ctx?.char?.chaId,
+						contact: c
+					}), { imageFrom: undefined });
 					try {
 						await saveState(key);
+						await recordSharedProfile(view.ctx?.char?.chaId, c);
 					} catch {
 						Object.assign(c, old);
 						view.notice = "프로필 사진을 저장하지 못했어요.";
@@ -3794,7 +5648,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "act2",
 			"data-t": "profile-photo",
 			onclick: () => openEdit(c.id)
-		}, h("span", { class: "round" }, icon("camera")), "사진 변경")), h("section", { class: "card" }, h("h3", {}, "소개"), h("div", { class: "fact" }, icon("book"), h("span", {}, present ? "최근 대화에서 이름을 확인했어요." : "최근 대화에서 이름을 확인하지 못했어요.")), c.lore ? h("div", { class: "fact" }, icon("spark"), h("span", {}, `로어북 항목 "${c.lore}"`)) : null), analysisSection(state, c), memorySection(state, c), imageTagSection(state, c), photoCard, groups.length ? h("section", { class: "card" }, h("h3", {}, "함께 있는 단톡방"), groups.map((r) => h("button", {
+		}, h("span", { class: "round" }, icon("camera")), "사진 변경")), h("section", { class: "card" }, h("h3", {}, "소개"), h("div", { class: "fact" }, icon("book"), h("span", {}, present ? "최근 대화에서 이름을 확인했어요." : "최근 대화에서 이름을 확인하지 못했어요.")), c.lore ? h("div", { class: "fact" }, icon("spark"), h("span", {}, `로어북 항목 "${c.lore}"`)) : null), analysisSection(state, c), memorySection(state, c), imageTagSection(state, c), photoReferenceSection(state, c), photoCard, groups.length ? h("section", { class: "card" }, h("h3", {}, "함께 있는 단톡방"), groups.map((r) => h("button", {
 			class: "row flat",
 			onclick: () => openRoom(r)
 		}, roomAvatar(state, r, 40), h("span", { class: "mid" }, h("span", { class: "nm" }, r.name), h("span", { class: "pv" }, h("span", { class: "tx" }, `${r.members.length + 1}명`)))))) : null, h("section", { class: "card" }, h("h3", {}, "채팅 설정"), toggleRow("이 대화를 본편에 반영", "이 사람과 나눈 대화를 본편 요청에 함께 보냅니다.", inject, async (on) => {
@@ -3832,7 +5686,10 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		return h("section", {
 			class: "card",
 			"data-t": "analysis-card"
-		}, h("div", { class: "actions flush" }, again("다시 분석하기")), c.contextUsage?.length ? h("pre", {
+		}, h("div", { class: "actions flush" }, again("다시 분석하기")), c.analysisSources?.length ? h("div", {
+			class: "sub",
+			"data-t": "analysis-lore-sources"
+		}, `연결된 로어북 ${c.analysisSources.length}개: ${c.analysisSources.map((s) => s.title).join(" / ")}`) : null, c.contextUsage?.length ? h("pre", {
 			class: "debug-raw",
 			"data-t": "analysis-context-usage"
 		}, contextUsageText(c.contextUsage)) : null, h("details", { "data-t": "analysis-details" }, h("summary", {
@@ -3850,6 +5707,39 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		return count >= 5e3 ? "많이 학습됨" : count >= 1e3 ? "학습됨" : "적게 학습됨 · 덜 닮을 수 있어요";
 	}
 	const memoryDeletes = new Set();
+	const profileRelationshipJobs = new Set();
+	function currentRelationshipSection(state, c) {
+		const key = view.key, ctx = view.ctx;
+		const token = key + "|" + c.id;
+		const current = currentRelationships(c, state, ctx?.chat || {});
+		const rows = Object.entries(current).filter(([, v]) => Object.keys(v).length).map(([target, value]) => h("div", { class: "mem" }, h("strong", {}, target === "me" ? "나와의 관계" : state.contacts.find((p) => p.id === target)?.name || target), value.relation ? h("div", {}, `관계: ${value.relation}`) : null, value.feeling ? h("div", {}, `감정: ${value.feeling}`) : null, value.promises?.length ? h("div", {}, `약속: ${value.promises.join(" / ")}`) : null));
+		return h("details", { "data-t": "current-relationships" }, h("summary", { class: "analysis-summary" }, "현재 관계"), rows.length ? rows : h("div", { class: "sub" }, c.relationshipSeed?.schema === 1 ? "확인된 현재 관계가 없어요." : "메신저를 처음 사용할 때 현재 관계를 정리해요."), h("div", { class: "sub" }, "본편·본편 요약·이 인물의 대화에서 현재 관계를 정리해요. 다시 정리하면 모델 요청이 발생해요. 사용자가 쓴 설정 메모리는 우선해요."), view.relationshipError?.token === token ? h("div", {
+			class: "notice flush",
+			role: "alert"
+		}, view.relationshipError.text) : null, h("button", {
+			class: "pill",
+			"data-t": "relationship-refresh",
+			disabled: profileRelationshipJobs.has(token),
+			onclick: async () => {
+				if (profileRelationshipJobs.has(token) || !ctx) return;
+				profileRelationshipJobs.add(token);
+				view.relationshipError = null;
+				render();
+				try {
+					await initializeRelationships(ctx, state, [c], await parseCbs("{{user}}"), { force: true });
+					await saveState(key);
+				} catch (e) {
+					view.relationshipError = {
+						token,
+						text: e.message
+					};
+				} finally {
+					profileRelationshipJobs.delete(token);
+					if (view.key === key) render();
+				}
+			}
+		}, profileRelationshipJobs.has(token) ? "현재 관계 정리 중…" : "현재 관계 다시 정리"));
+	}
 	async function clearContactMemory(key, contactId, confirmedIds) {
 		const state = states.get(key), contact = state?.contacts.find((c) => c.id === contactId);
 		if (!state?.enabled || !state.newMemory || !contact || !Array.isArray(confirmedIds)) throw new Error("메모리를 지울 인물이나 화면 상태가 바뀌었어요.");
@@ -3884,8 +5774,11 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		const tidying = state.rooms.some((r) => r.members.includes(c.id) && memoryJobs.has(key + "|" + r.id));
 		const newest = (list) => list.slice().sort((a, b) => b.t - a.t);
 		const facts = newest(all.filter((x) => x.type === "fact"));
-		const pinned = newest(all.filter((x) => x.type !== "fact" && x.pinned && !x.archived));
-		const recent = newest(all.filter((x) => x.type !== "fact" && !x.pinned && !x.archived));
+		const talkItem = (x) => x.type !== "fact" && x.type !== "story" && x.type !== "open";
+		const pinned = newest(all.filter((x) => talkItem(x) && x.pinned && !x.archived));
+		const recent = newest(all.filter((x) => talkItem(x) && !x.pinned && !x.archived));
+		const open = newest(all.filter((x) => x.type === "open" && !x.archived));
+		const lived = newest(all.filter((x) => x.type === "story" && !x.archived));
 		const archived = newest(all.filter((x) => x.type !== "fact" && x.archived));
 		const date = (t) => {
 			const d = new Date(t);
@@ -3905,7 +5798,23 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 					"aria-label": "메모리 고치기",
 					"data-t": "memory-edit-text"
 				}, x.text);
-				return h("div", { class: "mem" }, h("label", { class: "field flat" }, input), h("div", { class: "actions flush" }, h("button", {
+				const fixedType = [
+					"fact",
+					"story",
+					"open"
+				].includes(x.type);
+				const kind = fixedType ? null : h("select", {
+					"aria-label": "메모리 종류",
+					"data-t": "memory-edit-type"
+				}, Object.entries(MEMORY_TYPES).filter(([id]) => ![
+					"fact",
+					"story",
+					"open"
+				].includes(id)).map(([id, label]) => h("option", {
+					value: id,
+					selected: id === x.type
+				}, label)));
+				return h("div", { class: "mem" }, h("label", { class: "field flat" }, input), kind ? h("label", { class: "field flat" }, h("span", { class: "label" }, "종류"), kind) : null, h("div", { class: "actions flush" }, h("button", {
 					class: "pill primary",
 					"data-t": "memory-edit-save",
 					disabled: deleting,
@@ -3915,7 +5824,8 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 						Object.assign(x, {
 							text,
 							by: "user",
-							t: Date.now()
+							t: Date.now(),
+							...kind ? { type: kind.value } : {}
 						});
 						view.memEdit = "";
 						await save();
@@ -3946,7 +5856,8 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				x.archived ? x.merged ? "보관 · 합쳐짐" : "보관" : MEMORY_TYPES[x.type],
 				x.room || "",
 				date(x.t),
-				x.by === "user" ? "직접 씀" : ""
+				x.by === "user" ? "직접 씀" : "",
+				x.told?.n ? "이미 나눈 이야기" : ""
 			].filter(Boolean).join(" · ")), h("div", { class: "actions flush" }, x.type === "fact" ? null : pill(x.pinned ? "고정 해제" : "고정", "memory-pin", async () => {
 				x.pinned = !x.pinned;
 				if (x.pinned) {
@@ -3972,7 +5883,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		const typeSelect = h("select", {
 			"aria-label": "메모리 종류",
 			"data-t": "memory-type"
-		}, Object.entries(MEMORY_TYPES).map(([id, label]) => h("option", { value: id }, id === "fact" ? "설정 메모리" : `대화 메모리 · ${label}`)));
+		}, Object.entries(MEMORY_TYPES).filter(([id]) => id !== "story").map(([id, label]) => h("option", { value: id }, id === "fact" ? "설정 메모리" : `대화 메모리 · ${label}`)));
 		const input = h("textarea", {
 			rows: 2,
 			placeholder: "예: 매운 음식을 못 먹는다는 걸 안다",
@@ -4011,7 +5922,13 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			class: "notice flush",
 			role: "alert",
 			"data-t": "memory-clear-error"
-		}, "메모리를 삭제하지 못했어요. " + view.memDeleteError.text) : null, ...group("설정 메모리", facts, "아직 없어요."), ...group("고정", pinned, "고정한 메모리가 없어요."), ...group("최근", recent, "아직 없어요."), archived.length ? pill(archiveOpen ? "보관 접기" : `보관 ${archived.length}개 보기`, "memory-archive-toggle", () => {
+		}, "메모리를 삭제하지 못했어요. " + view.memDeleteError.text) : null, currentRelationshipSection(state, c), c.feeling?.text ? h("div", {
+			class: "sub",
+			"data-t": "memory-feeling"
+		}, `지금 마음: ${c.feeling.text}`) : null, c.chatNow?.text ? h("div", {
+			class: "sub",
+			"data-t": "memory-chat-now"
+		}, `메신저 속 지금: ${c.chatNow.text}`) : null, ...group("설정 메모리", facts, "아직 없어요."), ...group("고정", pinned, "고정한 메모리가 없어요."), ...group("최근", recent, "아직 없어요."), open.length ? group("열린 화제", open, "") : null, lived.length ? h("details", { "data-t": "memory-story" }, h("summary", { class: "analysis-summary" }, `본편에서 겪은 일 ${lived.length}`), h("div", { class: "sub top-gap" }, "본편을 읽고 이 인물이 직접 겪은 일만 이 인물의 기억으로 남긴 거예요. 본편 메시지를 다시 생성하거나 고치면 그 부분은 다시 읽어요."), lived.map(row)) : null, archived.length ? pill(archiveOpen ? "보관 접기" : `보관 ${archived.length}개 보기`, "memory-archive-toggle", () => {
 			view.memArchive = archiveOpen ? "" : c.id;
 			render();
 		}) : null, archiveOpen ? archived.map(row) : null, archived.length >= MEMORY_ARCHIVE ? h("div", {
@@ -4029,6 +5946,91 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				await save();
 			}
 		}, "추가")));
+	}
+	function photoReferenceSection(state, c) {
+		const key = view.key;
+		const save = async (next) => {
+			c.photoReference = next;
+			await saveState(key);
+			if (view.key === key) render();
+		};
+		const [shots, rooms] = profilePhotoGroups(state, c);
+		const choose = (title, assets, groups) => {
+			const sheet = h("div", {
+				class: "picker-sheet",
+				role: "dialog",
+				"aria-modal": "true",
+				"aria-label": title,
+				"data-t": "reference-picker"
+			}, h("div", { class: "top line-b" }, h("button", {
+				class: "plain",
+				"aria-label": "닫기",
+				"data-t": "reference-picker-close",
+				onclick: () => sheet.remove()
+			}, icon("back", 24)), h("h1", { class: "small" }, title)), h("div", { class: "picker-body" }, assetGallery(c, state, assets, async (a) => {
+				try {
+					const source = a.photoId ? await photoOriginal(a.photoId) : a.path;
+					if (!source || view.key !== key) return;
+					const image = await keepProfileImage(source, {
+						botId: view.ctx?.char?.chaId,
+						contact: c
+					});
+					if (view.key !== key) return;
+					await save({
+						...c.photoReference,
+						image
+					});
+					sheet.remove();
+				} catch (e) {
+					view.notice = e.message;
+					render();
+				}
+			}, null, groups)));
+			document.getElementById("win").append(sheet);
+		};
+		const assets = view.assets || [];
+		const source = c.photoReference?.image || c.image;
+		const preview = source ? lazily(h("div", {
+			class: "center",
+			"data-t": "reference-preview"
+		}), async () => {
+			const url = await imageUrl(source);
+			if (url) preview.append(h("img", {
+				src: url,
+				alt: `${c.name} 레퍼런스 원본`,
+				style: "max-width:100%;max-height:160px;object-fit:contain"
+			}));
+		}) : null;
+		return h("section", {
+			class: "card",
+			"data-t": "person-reference"
+		}, h("h3", {}, "사진 레퍼런스"), referenceControls(c.photoReference, imageCfg.reference, save, true), preview, h("div", {
+			class: "sub",
+			"data-t": "reference-source"
+		}, c.photoReference?.image ? "따로 고른 원본 이미지를 사용해요. 프로필 사진은 그대로예요." : c.image ? "현재 프로필의 원본 이미지를 사용해요. 얼굴 표시 영역은 적용하지 않아요." : "프로필 또는 레퍼런스 이미지를 먼저 골라 주세요."), h("div", { class: "actions" }, h("button", {
+			class: "pill",
+			"data-t": "reference-shots",
+			disabled: !shots.some(([, p]) => p.length),
+			onclick: () => choose("레퍼런스 · 생성 프로필", null, shots)
+		}, "생성 프로필"), h("button", {
+			class: "pill",
+			"data-t": "reference-rooms",
+			disabled: !rooms.some(([, p]) => p.length),
+			onclick: () => choose("레퍼런스 · 채팅 사진", null, rooms)
+		}, "채팅 사진"), h("button", {
+			class: "pill",
+			"data-t": "reference-assets",
+			disabled: !assets.length,
+			onclick: () => choose("레퍼런스 · 에셋", assets, [])
+		}, "에셋"), c.photoReference?.image ? h("button", {
+			class: "pill",
+			"data-t": "reference-reset",
+			onclick: () => {
+				const next = { ...c.photoReference };
+				delete next.image;
+				return save(next);
+			}
+		}, "프로필 원본으로") : null), referenceHint());
 	}
 	function imageTagSection(state, c) {
 		const sent = photosOf(state, c.id);
@@ -4062,6 +6064,12 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			"aria-label": "기본 의상 태그",
 			"data-t": "tag-outfit"
 		}, parts.outfit);
+		const backgroundInput = h("textarea", {
+			rows: 2,
+			"aria-label": "프로필 배경 태그",
+			"data-t": "tag-background",
+			placeholder: "예: night sky, rooftop, city lights"
+		}, t?.background || "");
 		const gender = h("select", {
 			"aria-label": "성별",
 			"data-t": "tag-gender"
@@ -4087,6 +6095,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 					gender: gender.value,
 					looks: cleanTags(looksInput.value, 600),
 					outfit: cleanTags(outfitInput.value, 400),
+					background: cleanTags(backgroundInput.value, 300),
 					manual: true
 				};
 				await checkImageTags(tags);
@@ -4116,6 +6125,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				render();
 				try {
 					await drawProfile(key, state, c);
+					if (view.key === key) view.profileDrawn = c.id;
 				} catch (e) {
 					c.imageTagError = e.message;
 				} finally {
@@ -4124,6 +6134,30 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				}
 			}
 		}, drawing ? "프로필 그리는 중…" : "NAI로 프로필 그리기") : null;
+		const botId = ctx?.char?.chaId;
+		const bgChoices = botId ? profileBgLoaded(botId) : {};
+		const ownBg = bgChoices ? profileBgOf(c, bgChoices) : "";
+		const globalBg = bgChoices?.all === "on" ? "포함" : "제외(흰 배경)";
+		const bgSelect = imageCfg.enabled && botId && bgChoices ? h("label", { class: "field flat" }, h("span", { class: "label" }, "프로필 배경"), h("select", {
+			"data-t": "profile-bg",
+			"aria-label": "프로필 배경",
+			onchange: async (e) => {
+				try {
+					await setProfileBg(botId, c, e.target.value);
+				} catch (err) {
+					c.imageTagError = err.message;
+				}
+				render();
+			}
+		}, [
+			["", `설정 따름 · ${globalBg}`],
+			["on", "포함"],
+			["off", "제외(흰 배경)"]
+		].map(([v, label]) => h("option", {
+			value: v,
+			selected: ownBg === v
+		}, label)))) : null;
+		const bgMissing = imageCfg.enabled && bgChoices && profileBgOn(c, bgChoices) && !String(t?.background || "").trim();
 		return h("section", {
 			class: "card",
 			"data-t": "image-tags"
@@ -4134,13 +6168,19 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				tab: "photos",
 				galleryWho: c.id
 			})
-		}, "사진 모두 보기") : null, drawBtn ? h("div", { class: "actions flush" }, drawBtn) : null, strip.length ? h("div", { class: "sub top-gap" }, "사진을 눌러 크게 본 뒤 \"프로필로\"를 누르면 그 사진을 프로필로 씁니다.") : null, h("div", {
+		}, "사진 모두 보기") : null, view.profileDrawn === c.id ? h("div", {
+			class: "notice flush",
+			"data-t": "profile-drawn"
+		}, "프로필 그림을 그렸어요. 그림을 눌러 크게 본 뒤 \"프로필로\"를 누르면 프로필이 돼요.") : null, bgSelect, bgMissing ? h("div", {
+			class: "sub",
+			"data-t": "profile-bg-missing"
+		}, "배경 태그가 없어서 그림체 설정의 배경이 그대로 나와요. \"사진 태그 고치기\"에서 배경 태그를 넣거나 \"태그 다시 분석\"을 눌러 주세요.") : null, drawBtn ? h("div", { class: "actions flush" }, drawBtn) : null, strip.length ? h("div", { class: "sub top-gap" }, "사진을 눌러 크게 본 뒤 \"프로필로\"를 누르면 그 사진을 프로필로 씁니다.") : null, h("div", {
 			class: "sub top-gap",
 			"data-t": "tag-status"
 		}, status), c.imageTagError ? h("div", {
 			class: "notice flush",
 			role: "alert"
-		}, c.imageTagError) : null, imageCfg.enabled ? h("details", { "data-t": "tag-details" }, h("summary", { class: "analysis-summary" }, "사진 태그 고치기"), h("label", { class: "field flat" }, h("span", { class: "label" }, "캐릭터 태그 (NovelAI에서 확인)"), charInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "작품 태그"), copyInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "외형 태그"), looksInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "기본 의상 태그 (옷 요청이 없을 때 입는 옷)"), outfitInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "성별"), gender), h("div", { class: "actions" }, h("button", {
+		}, c.imageTagError) : null, imageCfg.enabled ? h("details", { "data-t": "tag-details" }, h("summary", { class: "analysis-summary" }, "사진 태그 고치기"), h("label", { class: "field flat" }, h("span", { class: "label" }, "캐릭터 태그 (NovelAI에서 확인)"), charInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "작품 태그"), copyInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "외형 태그"), looksInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "기본 의상 태그 (옷 요청이 없을 때 입는 옷)"), outfitInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "프로필 배경 태그 (배경 포함일 때 프로필 그리기에서만 사용)"), backgroundInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "성별"), gender), h("div", { class: "actions" }, h("button", {
 			class: "pill primary",
 			"data-t": "tag-save",
 			disabled: busy || !naiKey,
@@ -5919,6 +7959,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 				class: "sub",
 				"data-t": "story-memory-status"
 			}, state.storyIn === false ? "본편 → 메신저가 꺼져 있어 쓰지 않아요." : lastText) : null, t.newMemory ? h("details", { "data-t": "memory-details" }, h("summary", { class: "sub" }, "세부 설정"), toggleRow("메모리 자동 정리", `한 방에 새 메시지가 ${MEMORY_EVERY}개 쌓이면 답장 뒤에 모델을 한 번 불러 기억할 것을 정리합니다. 끄면 저장된 기억만 사용합니다.`, !!t.memoryOn, (value) => set("memoryOn", value), "memory-on")) : null),
+			bot ? null : storyBacklogCard(state),
 			timeCard(state, bot, t, set),
 			contextBudgetSection(state, bot),
 			followCard(state, bot, "polish", "캐릭터 계정에서 말투로 다듬기", toggleRow("말투로 다듬기", "켜면 캐릭터 계정에서 보내기를 누를 때 그 캐릭터 말투로 다듬은 문장이 입력창에 들어가요. 확인하거나 고친 뒤 다시 누르면 보내요. 끄면 쓴 그대로 보내고, 캐릭터는 그 말투를 따라 하지 않고 한 일과 약속만 기억해요.", t.polish !== false, (value) => set("polish", value), "polish")),
@@ -5937,6 +7978,42 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 			}, tidying ? "정리하는 중…" : `지금 정리 (방 ${pending.length}개, 모델 ${pending.length}회)`) : null) : null,
 			bot ? botActions(state) : null
 		]))];
+	}
+	function profileBgSection(state) {
+		const botId = view.ctx?.char?.chaId;
+		const choices = botId ? profileBgLoaded(botId) : null;
+		if (!botId || !choices) return null;
+		const own = Object.keys(choices.people).length;
+		const act = async (fn, done) => {
+			try {
+				await fn();
+				view.notice = done;
+			} catch (e) {
+				view.notice = "프로필 배경을 바꾸지 못했어요. " + e.message;
+			}
+			render();
+		};
+		const drawing = imageCfg.enabled ? [
+			settingSelect("프로필 배경", choices.all, [["off", "제외 · 흰 배경"], ["on", "포함 · 인물에 맞는 배경"]], (v) => act(() => setBotProfileBg(botId, v), ""), "profile-bg-global", "bot"),
+			h("div", { class: "sub" }, `인물 프로필 화면에서 인물마다 따로 정할 수도 있어요.${own ? ` 따로 정한 인물 ${own}명은 그 값을 따라요.` : ""}`),
+			h("div", { class: "actions flush" }, h("button", {
+				class: "pill",
+				"data-t": "profile-bg-all-on",
+				onclick: () => act(() => setAllProfileBg(botId, "on"), "이 봇의 모든 인물 프로필 배경을 \"포함\"으로 맞췄어요.")
+			}, "모두 포함"), h("button", {
+				class: "pill",
+				"data-t": "profile-bg-all-off",
+				onclick: () => act(() => setAllProfileBg(botId, "off"), "이 봇의 모든 인물 프로필 배경을 \"제외(흰 배경)\"로 맞췄어요.")
+			}, "모두 제외")),
+			h("div", { class: "sub" }, "\"모두 포함·모두 제외\"는 이 봇에서 인물마다 따로 정한 값도 풀어요.")
+		] : [];
+		return h("section", {
+			class: "card",
+			"data-t": "profile-bg-settings"
+		}, h("h3", {}, "프로필 사진"), ...drawing, linkRow("보관된 프로필 이미지", "\"프로필로\" 고른 이미지를 원본 그대로 보관해요. 골라서 지울 수 있어요.", () => {
+			view.kept = null;
+			go("set-profile-images", { notice: "" });
+		}, "open-profile-images", "bot"));
 	}
 	function photoSettingsScreen(state) {
 		const key = view.key;
@@ -5980,7 +8057,13 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		}, "image-ask-mode", "all")), h("section", { class: "card" }, h("h3", {}, "사진 보내기"), toggleRow("보낸 사진을 모델에게도 보여 주기", "켜면 방금 보낸 사진을 답장 모델에 이미지로도 함께 보내요. 이미지를 볼 수 있는 모델을 쓸 때만 켜 주세요. 끄면 사진 설명만 보내요.", imageCfg.seePhotos === true, async (on) => {
 			imageCfg.seePhotos = on;
 			await save();
-		}, "see-photos", "all")), chatStyleSection(state), imageTagSummary(state))];
+		}, "see-photos", "all")), h("section", {
+			class: "card",
+			"data-t": "reference-settings"
+		}, h("h3", {}, "사진 레퍼런스"), referenceControls(imageCfg.reference, {}, async (next) => {
+			imageCfg.reference = next;
+			await save();
+		}), referenceHint(), h("div", { class: "sub" }, "인물별 프로필에서 별도 이미지를 고르거나 값을 바꿀 수 있어요. 기본은 현재 프로필 원본입니다.")), profileBgSection(state), chatStyleSection(state), imageTagSummary(state))];
 	}
 	function setupSettingsScreen(state) {
 		const key = view.key;
@@ -6093,14 +8176,18 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 //#endregion
 //#region src/ui/styles.js
 	const CSS = `
+.backlog-dialog{width:min(100%,440px)}.backlog-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.backlog-heading h2{margin:0}.backlog-dialog>.backlog-card{border-top:0;padding:0}.backlog-overview{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:14px 0 8px}.backlog-cost{background:var(--bg2);border-radius:10px;padding:12px;margin-top:12px}.backlog-cost strong{display:block;font-size:14px;margin-bottom:6px}.backlog-cost .sub+.sub{margin-top:6px}.backlog-card>.sub{line-height:1.5}.backlog-card .actions.flush{padding-top:12px}
 .crop-overlay{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:12px}
 .card.dialog-card{width:100%;max-width:420px;max-height:85vh;overflow:auto;background:var(--bg);color:var(--text);border-top:0;border-radius:16px;padding:18px;box-shadow:var(--shadow)}.check-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;cursor:pointer}.check-row input{flex:none;width:18px;height:18px;margin:2px 0 0}
 .crop-panel{background:var(--bg);color:var(--text);width:min(100%,380px);max-height:100%;overflow:auto;border-radius:16px;padding:18px;box-shadow:var(--shadow)}
 .crop-panel h2{margin:0 0 8px;font-size:19px}.crop-stage{display:block;width:min(100%,280px);height:auto;aspect-ratio:1;border-radius:50%;margin:14px auto;touch-action:none;cursor:grab;background:var(--bg2);outline:2px solid var(--line)}
 .crop-stage:active{cursor:grabbing}.crop-small{width:64px;height:64px;flex:none;border-radius:50%;background:var(--bg2)}.crop-preview{display:flex;align-items:center;gap:14px}.crop-panel input[type=range]{width:100%;touch-action:pan-x}.crop-panel .actions{justify-content:flex-end}
-:root{color-scheme:light;--bg:#fff;--bg2:#f0f2f5;--hover:#f2f2f2;--line:#ced0d4;--text:#050505;--sub:#65676b;--other:#e4e6eb;--blue:#0084ff;--green:#31a24c;--red:#e41e3f;--scrim:rgba(17,24,39,.22);--shadow:0 12px 40px rgba(0,0,0,.3)}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#242526;--bg2:#3a3b3c;--hover:#3a3b3c;--line:#3e4042;--text:#e4e6eb;--sub:#b0b3b8;--other:#3e4042;--blue:#2e89ff;--green:#45bd62;--red:#ff6b81;--scrim:rgba(0,0,0,.4);--shadow:0 12px 40px rgba(0,0,0,.6)}}
-:root[data-theme=dark]{color-scheme:dark;--bg:#242526;--bg2:#3a3b3c;--hover:#3a3b3c;--line:#3e4042;--text:#e4e6eb;--sub:#b0b3b8;--other:#3e4042;--blue:#2e89ff;--green:#45bd62;--red:#ff6b81;--scrim:rgba(0,0,0,.4);--shadow:0 12px 40px rgba(0,0,0,.6)}
+:root{--bg:#fff;--bg2:#f0f2f5;--hover:#f2f2f2;--line:#ced0d4;--text:#050505;--sub:#65676b;--other:#e4e6eb;--blue:#0084ff;--green:#31a24c;--red:#e41e3f;--scrim:rgba(17,24,39,.22);--shadow:0 12px 40px rgba(0,0,0,.3)}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#242526;--bg2:#3a3b3c;--hover:#3a3b3c;--line:#3e4042;--text:#e4e6eb;--sub:#b0b3b8;--other:#3e4042;--blue:#2e89ff;--green:#45bd62;--red:#ff6b81;--scrim:rgba(0,0,0,.4);--shadow:0 12px 40px rgba(0,0,0,.6)}}
+:root[data-theme=dark]{--bg:#242526;--bg2:#3a3b3c;--hover:#3a3b3c;--line:#3e4042;--text:#e4e6eb;--sub:#b0b3b8;--other:#3e4042;--blue:#2e89ff;--green:#45bd62;--red:#ff6b81;--scrim:rgba(0,0,0,.4);--shadow:0 12px 40px rgba(0,0,0,.6)}
+body{color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]) body{color-scheme:dark}}
+:root[data-theme=dark] body{color-scheme:dark}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;height:100%;background:transparent!important;overflow:hidden;font:15px/1.34 Roboto,"Noto Sans KR","Segoe UI","Apple SD Gothic Neo","Malgun Gothic",sans-serif;color:var(--text)}
 button,input,textarea,select{font:inherit;color:inherit}
@@ -6779,6 +8866,177 @@ button.row:hover,.rowmain:hover{background:var(--hover)}
 	}
 
 //#endregion
+//#region src/ui/screens/profile-images.js
+	const PAGE = 24;
+	const USE_LABEL = {
+		here: "이 채팅에서 사용 중",
+		shared: "새 채팅 기본 프로필",
+		other: "다른 채팅에서 사용 중"
+	};
+	const mb = (chars) => (chars * .75 / 1048576).toFixed(1);
+	function load(state) {
+		const key = view.key, ctx = view.ctx;
+		const entry = view.kept = {
+			key,
+			items: null,
+			usage: null,
+			shown: PAGE,
+			selected: new Set(),
+			error: ""
+		};
+		(async () => {
+			const index = await keptIndex(ctx?.char?.chaId);
+			const usage = await keptUsage(ctx, key, state);
+			entry.items = Object.entries(index).map(([id, meta]) => ({
+				id,
+				...meta
+			})).sort((a, b) => (b.t || 0) - (a.t || 0));
+			entry.usage = usage;
+		})().catch((e) => {
+			entry.error = e.message;
+		}).finally(() => {
+			if (view.kept === entry) render();
+		});
+		return entry;
+	}
+	function profileImagesScreen(state) {
+		const k = view.kept?.key === view.key ? view.kept : load(state);
+		const body = h("div", {
+			class: "scroll",
+			id: "scroll"
+		});
+		if (view.notice) body.append(h("div", {
+			class: "notice",
+			"data-t": "notice"
+		}, view.notice));
+		const head = subHead("보관된 프로필 이미지", "set-photo");
+		if (k.error) {
+			body.append(h("div", {
+				class: "notice",
+				role: "alert",
+				"data-t": "kept-error"
+			}, "목록을 불러오지 못했어요. " + k.error));
+			return [head, body];
+		}
+		if (!k.items) {
+			body.append(h("div", { class: "hello" }, h("div", {
+				class: "meta",
+				"data-t": "kept-loading"
+			}, h("span", { class: "spin small" }), " 이 봇의 채팅에서 사용처를 확인하는 중…")));
+			return [head, body];
+		}
+		const total = k.items.reduce((n, i) => n + (i.size || 0), 0);
+		body.append(h("div", {
+			class: "notice",
+			"data-t": "kept-summary"
+		}, `이 봇에 보관된 이미지 ${k.items.length}장 · 약 ${mb(total)}MB. "프로필로" 고른 이미지를 원본 그대로 보관해요. 자동으로 지우지 않고, 고른 것만 지워요.`));
+		if (!k.items.length) {
+			body.append(h("div", { class: "hello" }, h("div", {
+				class: "meta",
+				"data-t": "kept-empty"
+			}, "보관된 이미지가 없어요.")));
+			return [head, body];
+		}
+		const usedOf = (id) => [...k.usage.get(PROFILE_REF + id) || []];
+		const chosenUsed = [...k.selected].filter((id) => usedOf(id).length);
+		const delBtn = h("button", {
+			class: "pill" + (chosenUsed.length ? " danger" : " primary"),
+			"data-t": "kept-delete",
+			disabled: !k.selected.size || !!k.deleting,
+			onclick: async () => {
+				if (!delBtn.dataset.armed) {
+					delBtn.dataset.armed = "1";
+					delBtn.textContent = "한 번 더 누르면 삭제";
+					return;
+				}
+				k.deleting = true;
+				render();
+				try {
+					const ids = [...k.selected];
+					const people = await deleteKept(view.ctx, view.key, state, ids);
+					if (people && repairAutoImages(state, await gatherAssets(view.ctx))) await saveState(view.key);
+					view.notice = `이미지 ${ids.length}장을 지웠어요.${people ? ` 그 이미지를 쓰던 인물 ${people}명은 자동 프로필로 돌아갔어요.` : ""}`;
+					view.kept = null;
+				} catch (e) {
+					k.deleting = false;
+					view.notice = "지우지 못했어요. " + e.message;
+				}
+				render();
+			}
+		}, k.deleting ? "지우는 중…" : `선택 삭제 (${k.selected.size})`);
+		const row = (item) => {
+			const used = usedOf(item.id);
+			const thumb = h("span", {
+				class: "av",
+				style: "width:56px;height:56px;border-radius:10px"
+			});
+			lazily(thumb, async () => {
+				let url = await risuai.pluginStorage.getItem(PROFILE_THUMB_PREFIX + item.id);
+				if (typeof url !== "string" || !url) url = await imageUrl(PROFILE_REF + item.id);
+				if (url) thumb.append(h("img", {
+					src: url,
+					alt: ""
+				}));
+			});
+			return h("label", {
+				class: "row pick",
+				"data-t": "kept-row",
+				"data-id": item.id
+			}, thumb, h("span", { class: "mid" }, h("span", { class: "nm" }, item.name || "이름 없음"), h("span", { class: "pv" }, h("span", {
+				class: "tx" + (used.length ? " danger" : ""),
+				"data-t": "kept-status"
+			}, [
+				used.length ? used.map((u) => USE_LABEL[u]).join(" · ") : "사용 안 함",
+				new Date(item.t || 0).toLocaleDateString(),
+				`${mb(item.size || 0)}MB`
+			].join(" · ")))), h("input", {
+				type: "checkbox",
+				checked: k.selected.has(item.id),
+				"aria-label": `${item.name || "이미지"} 선택`,
+				"data-t": "kept-item",
+				onchange: (e) => {
+					if (e.target.checked) k.selected.add(item.id);
+					else k.selected.delete(item.id);
+					render();
+				}
+			}), h("span", { class: "check" }));
+		};
+		body.append(h("div", { class: "actions" }, h("button", {
+			class: "pill",
+			"data-t": "kept-unused",
+			onclick: () => {
+				k.selected = new Set(k.items.filter((i) => !usedOf(i.id).length).map((i) => i.id));
+				render();
+			}
+		}, "사용 안 함만 선택"), h("button", {
+			class: "pill",
+			"data-t": "kept-none",
+			onclick: () => {
+				k.selected.clear();
+				render();
+			}
+		}, "선택 해제"), delBtn));
+		if (chosenUsed.length) body.append(h("div", {
+			class: "notice",
+			role: "alert",
+			"data-t": "kept-warning"
+		}, `고른 이미지 중 ${chosenUsed.length}장은 사용 중이에요. 지우면 그 이미지를 프로필로 쓰던 인물은 모든 채팅에서 자동 프로필로 돌아가고, 새 채팅 기본 프로필이었으면 그 기록도 지워져요.`));
+		body.append(h("div", {
+			class: "rows",
+			"data-t": "kept-list"
+		}, k.items.slice(0, k.shown).map(row)));
+		if (k.items.length > k.shown) body.append(h("div", { class: "actions" }, h("button", {
+			class: "pill",
+			"data-t": "kept-more",
+			onclick: () => {
+				k.shown += PAGE;
+				render();
+			}
+		}, `더 보기 (${k.items.length - k.shown}장 남음)`)));
+		return [head, body];
+	}
+
+//#endregion
 //#region src/ui/screens/group.js
 	function groupScreen(state) {
 		const picked = new Set();
@@ -6952,7 +9210,7 @@ ${desc}`;
 			photo,
 			...flags
 		};
-		pushMessage(room, msg);
+		pushMessage(room, msg, states.get(key));
 		await saveState(key);
 		onPushed?.();
 		render();
@@ -6969,7 +9227,7 @@ ${desc}`;
 			text,
 			t: Date.now(),
 			...flags
-		});
+		}, states.get(key));
 		const saving = saveState(key).catch((e) => {
 			console.log("[interlude] save failed: " + e.message);
 			void systemFailure("storage", e, "send save failed");
@@ -7283,10 +9541,15 @@ ${desc}`;
 		});
 		if (view.editMessage?.key === view.key && view.editMessage.roomId === room.id) thread.append(messageEditPanel(room));
 		const writingStory = storyWriting.has(view.key + "|" + room.id);
+		const writingRelationship = relationshipWriting.has(view.key + "|" + room.id);
 		if (busyRooms.has(view.key + "|" + room.id) && !view.editMessage?.saving) thread.append(h("div", {
 			class: "msg",
 			"data-t": "typing"
-		}, h("span", { class: "slot" }, avatar(members[0], 28)), h("div", { class: "col" }, writingStory ? h("div", {
+		}, h("span", { class: "slot" }, avatar(members[0], 28)), h("div", { class: "col" }, writingRelationship ? h("div", {
+			class: "b typing story",
+			role: "status",
+			"data-t": "relationship-writing"
+		}, h("span", { class: "spin small" }), "현재 관계 정리 중…") : writingStory ? h("div", {
 			class: "b typing story",
 			role: "status",
 			"data-t": "story-writing"
@@ -7641,7 +9904,7 @@ ${desc}`;
 			"set-backup",
 			"debug"
 		];
-		const screen = !state.enabled && !shared.includes(view.screen) ? settingsScreen : view.screen === "context-settings" ? contextSettingsScreen : view.screen === "switch" ? switchScreen : view.screen === "me" ? myProfileScreen : view.screen === "set-talk" ? chatSettingsScreen : view.screen === "set-photo" ? photoSettingsScreen : view.screen === "set-setup" ? setupSettingsScreen : view.screen === "set-manage" ? manageSettingsScreen : view.screen === "set-backup" ? backupSettingsScreen : view.screen === "room" ? roomScreen : view.screen === "profile" ? profileScreen : view.screen === "edit" ? editScreen : view.screen === "group" ? groupScreen : view.screen === "pick" ? pickScreen : view.screen === "reanalyze" ? reanalyzeScreen : view.screen === "terms" ? termsScreen : view.screen === "modules" ? modulesScreen : view.screen === "my-photo" ? myPhotoScreen : view.screen === "settings" ? settingsScreen : view.screen === "style-edit" ? styleEditScreen : view.screen === "bot-apply" ? botApplyScreen : view.screen === "bot-budget" ? botBudgetScreen : view.screen === "debug" ? debugScreen : listScreen;
+		const screen = !state.enabled && !shared.includes(view.screen) ? settingsScreen : view.screen === "context-settings" ? contextSettingsScreen : view.screen === "switch" ? switchScreen : view.screen === "me" ? myProfileScreen : view.screen === "set-talk" ? chatSettingsScreen : view.screen === "set-photo" ? photoSettingsScreen : view.screen === "set-profile-images" ? profileImagesScreen : view.screen === "set-setup" ? setupSettingsScreen : view.screen === "set-manage" ? manageSettingsScreen : view.screen === "set-backup" ? backupSettingsScreen : view.screen === "room" ? roomScreen : view.screen === "profile" ? profileScreen : view.screen === "edit" ? editScreen : view.screen === "group" ? groupScreen : view.screen === "pick" ? pickScreen : view.screen === "reanalyze" ? reanalyzeScreen : view.screen === "terms" ? termsScreen : view.screen === "modules" ? modulesScreen : view.screen === "my-photo" ? myPhotoScreen : view.screen === "settings" ? settingsScreen : view.screen === "style-edit" ? styleEditScreen : view.screen === "bot-apply" ? botApplyScreen : view.screen === "bot-budget" ? botBudgetScreen : view.screen === "debug" ? debugScreen : listScreen;
 		const nodes = screen(state);
 		const kept = live ? keepAround(document.getElementById("win"), nodes, live) : false;
 		if (!kept) document.getElementById("win").replaceChildren(...nodes);
@@ -7651,6 +9914,14 @@ ${desc}`;
 		if (updateSettings) document.getElementById("win").append(updateSettings);
 		const followAll = followAllPanel(state);
 		if (followAll) document.getElementById("win").append(followAll);
+		document.querySelector("[data-t=\"story-backlog-notice\"]")?.remove();
+		document.querySelector("[data-t=\"story-backlog-dialog\"]")?.remove();
+		if (!deletion && !updateSettings && !followAll) {
+			const storyNotice = storyBacklogNotice(state);
+			if (storyNotice) document.getElementById("win").insertBefore(storyNotice, document.getElementById("scroll"));
+			const storyDialog = storyBacklogDialog(state);
+			if (storyDialog) document.getElementById("win").append(storyDialog);
+		}
 		if (view.viewer && state.enabled) {
 			const overlay = viewerOverlay(state);
 			if (overlay) document.getElementById("win").append(overlay);
@@ -7933,8 +10204,8 @@ ${words}`
 		const budget = contextBudget(state);
 		let left = budget.replyTotal;
 		for (const member of members) {
-			const source = await memberLoreSource(member, books);
-			const lore = cardLore(member, source, budget.analysis);
+			const parts = await memberLoreParts(member, books), source = parts.join("\n\n");
+			const lore = cardLore(member, parts, budget.analysis);
 			const note = member.cardNote ? `\n사용자 메모(가장 우선): ${member.cardNote}` : "";
 			let text;
 			const verified = member.card && member.cardSchema === 2 && (member.analysisLore ? member.analysisLore === lore : member.loreHash === loreHash(lore)) ? verifiedSharedCard(member.card, lore) : null;
@@ -7971,14 +10242,66 @@ ${words}`
 			member.name,
 			...member.aliases || []
 		].map(normalize).filter((n) => n.length >= 2);
-		return member.lore && books.find((e) => normalize(loreTitle(e)) === normalize(member.lore)) || books.find((e) => normalize(loreTitle(e)) === normalize(member.name)) || books.find((e) => needles.some((n) => normalize(baseTitle(loreTitle(e))) === n)) || books.find((e) => needles.some((n) => n.length >= 2 && normalize(loreTitle(e)).includes(n))) || books.find((e) => needles.some((n) => String(e.key || "").split(",").some((k) => normalize(k) === n)));
+		return member.loreId && books.find((e) => String(e.id || "") === member.loreId) || member.lore && books.find((e) => normalize(loreTitle(e)) === normalize(member.lore)) || books.find((e) => normalize(loreTitle(e)) === normalize(member.name)) || books.find((e) => needles.some((n) => normalize(baseTitle(loreTitle(e))) === n)) || books.find((e) => needles.some((n) => n.length >= 2 && normalize(loreTitle(e)).includes(n))) || books.find((e) => needles.some((n) => String(e.key || "").split(",").some((k) => normalize(k) === n)));
+	}
+	const loreEntryRef = (entry) => entry.id ? "id:" + entry.id : "title:" + loreTitle(entry);
+	function findLoreEntries(member, books) {
+		const primary = findLoreEntry(member, books);
+		const names = new Set([
+			member.name,
+			member.lore,
+			...member.aliases || []
+		].map((n) => normalize(baseTitle(String(n || "")))).filter(Boolean));
+		const explicit = new Set(member.loreIds || []);
+		const selected = Array.isArray(member.loreSelection) ? new Set(member.loreSelection) : null;
+		const matches = (entry) => {
+			if (selected) return selected.has(loreEntryRef(entry));
+			if (explicit.has(String(entry.id || ""))) return true;
+			if (primary?.folder && entry.folder && primary.folder !== entry.folder) return false;
+			const title = normalize(baseTitle(loreTitle(entry)));
+			const firstKey = normalize(String(entry.key || "").split(",")[0]);
+			return names.has(title) || names.has(firstKey);
+		};
+		return [...new Set([...primary ? [primary] : [], ...books.filter((e) => e !== primary && matches(e))])];
+	}
+	async function memberLoreParts(member, books) {
+		const entries = findLoreEntries(member, books), seen = new Set(), parts = [];
+		for (const entry of entries) {
+			const body = cleanStory(await parseCbs(entry.content));
+			if (!body || seen.has(body)) continue;
+			seen.add(body);
+			parts.push(parts.length ? `[로어 항목: ${loreTitle(entry)}]\n${body}` : body);
+		}
+		return parts;
 	}
 	async function memberLoreSource(member, books) {
-		const entry = findLoreEntry(member, books);
-		return entry ? cleanStory(await parseCbs(entry.content)) : "";
+		return (await memberLoreParts(member, books)).join("\n\n");
+	}
+	function balancedLore(parts, limit, cut) {
+		const source = parts.join("\n\n");
+		if (parts.length < 2 || source.length <= limit) return cut(source, limit);
+		let left = limit - 2 * (parts.length - 1);
+		if (left <= 0) return source.slice(0, limit);
+		const share = new Array(parts.length).fill(0);
+		const order = parts.map((p, i) => i).sort((a, b) => parts[a].length - parts[b].length);
+		order.forEach((i, n) => {
+			share[i] = Math.min(parts[i].length, Math.floor(left / (order.length - n)));
+			left -= share[i];
+		});
+		return parts.map((p, i) => cut(p, share[i])).filter(Boolean).join("\n\n");
 	}
 	async function memberLoreText(member, books, limit = LORE_PER_MEMBER, report) {
-		return budgetText(await memberLoreSource(member, books), limit, "analysis", report, member.id);
+		const parts = await memberLoreParts(member, books), source = parts.join("\n\n"), cap = Math.max(0, limit);
+		const used = balancedLore(parts, cap, (text, n) => text.slice(0, n));
+		if (report) report.push({
+			section: "analysis",
+			memberId: member.id,
+			sourceChars: source.length,
+			usedChars: used.length,
+			limit: cap,
+			truncated: used.length < source.length
+		});
+		return used;
 	}
 	const CARD_FIRST = /name|identity|occupation|role|affiliation|personality|core|speech|dialogue|relationship|belief|value|goal|motivation|social|emotion|behavio|habit|이름|정체|직업|소속|직책|성격|말투|대사|관계|가치|목표|습관|감정/i;
 	const CARD_LAST = /appearance|body|physical|outfit|cloth|sexual|kink|fetish|nsfw|외모|외형|신체|복장|의상|성적|성향|성생활/i;
@@ -8008,14 +10331,18 @@ ${words}`
 		if (!picked.size) return text.slice(0, limit);
 		return parts.filter((p) => picked.has(p.i)).map((p) => p.text).join("");
 	}
-	function cardLore(member, source, limit, fresh = false) {
-		const plain = source.slice(0, limit);
-		if (!fresh && member.card && (member.analysisLore ? member.analysisLore === plain : member.loreHash === loreHash(plain))) return plain;
-		return cardFocus(source, limit);
+	function cardLore(member, parts, limit, fresh = false) {
+		if (!Array.isArray(parts)) parts = [String(parts || "")];
+		const source = parts.join("\n\n");
+		if (parts.length < 2) {
+			const plain = source.slice(0, limit);
+			if (!fresh && member.card && (member.analysisLore ? member.analysisLore === plain : member.loreHash === loreHash(plain))) return plain;
+		}
+		return balancedLore(parts, limit, cardFocus);
 	}
 	async function memberCardText(member, books, limit = LORE_PER_MEMBER, report, fresh = false) {
-		const source = await memberLoreSource(member, books), cap = Math.max(0, limit);
-		const text = cardLore(member, source, cap, fresh);
+		const parts = await memberLoreParts(member, books), source = parts.join("\n\n"), cap = Math.max(0, limit);
+		const text = cardLore(member, parts, cap, fresh);
 		if (report) report.push({
 			section: "analysis",
 			memberId: member.id,
@@ -8345,18 +10672,17 @@ ${lore.slice(0, 1200)}`;
 		}
 	}
 	const storeSharedAnalysis = systemInstrument("storage", storeSharedAnalysisRaw, (r) => r);
-	async function reuseAnalysis(contact, lore, options) {
+	async function reusableCard(contact, lore, options) {
 		const { botId } = options;
-		if (!botId || !lore) return false;
+		if (!botId || !lore) return null;
 		const key = sharedAnalysisKey(botId, contact, lore);
 		const saved = !options.knownKeys || options.knownKeys.has(key) ? await readJson(key) : null;
 		if (saved?.schema === 2 && saved.botId === botId && saved.person === personKey(contact) && saved.lore === lore) {
 			const card = verifiedSharedCard(saved.card, lore);
-			if (card) {
-				applySharedAnalysis(contact, card, lore);
-				contact.analysisReused = true;
-				return true;
-			}
+			if (card) return {
+				card,
+				shared: true
+			};
 		}
 		const validLocal = (c) => c?.cardSchema === 2 && (c.analysisLore === lore || !c.analysisLore && c.loreHash === loreHash(lore)) && verifiedSharedCard(c.card, lore);
 		let card = validLocal(contact);
@@ -8369,14 +10695,71 @@ ${lore.slice(0, 1200)}`;
 				break;
 			}
 		}
-		if (!card) return false;
-		applySharedAnalysis(contact, card, lore);
+		return card ? {
+			card,
+			shared: false
+		} : null;
+	}
+	async function reuseAnalysis(contact, lore, options) {
+		const found = await reusableCard(contact, lore, options);
+		if (!found) return false;
+		applySharedAnalysis(contact, found.card, lore);
 		contact.analysisReused = true;
-		await storeSharedAnalysis(key, botId, contact, lore, card);
+		if (!found.shared) await storeSharedAnalysis(sharedAnalysisKey(options.botId, contact, lore), options.botId, contact, lore, found.card);
 		return true;
+	}
+	const ANALYSIS_PROMPT_CHARS = 1800;
+	const BIO_PROMPT_CHARS = 2800;
+	const IMAGE_TAG_PROMPT_CHARS = 1e3;
+	async function analysisEstimate(ctx, state, people, force = false) {
+		const books = await loreBooks(), options = {
+			...analysisOptions(ctx, force),
+			budget: contextBudget(state)
+		};
+		options.knownKeys = new Set(await risuai.pluginStorage.keys() || []);
+		options.knownKeys.add(ctx.key);
+		options.chatStates.set(ctx.key, Promise.resolve(state));
+		const result = {
+			fresh: 0,
+			reused: 0,
+			noLore: 0,
+			calls: 0,
+			chars: 0
+		};
+		for (const person of people) {
+			const lore = await memberCardText(person, books, options.budget.analysis, undefined, force);
+			if (!lore) {
+				result.noLore++;
+				continue;
+			}
+			const found = force ? null : await reusableCard(person, lore, options);
+			if (found) result.reused++;
+			else {
+				result.fresh++;
+				result.calls++;
+				result.chars += ANALYSIS_PROMPT_CHARS + lore.length;
+			}
+			const card = found?.card;
+			if (!person.manualBio && !(card && card.bioSchema === 1 && profileBio(card["한줄소개"]))) {
+				result.calls++;
+				result.chars += BIO_PROMPT_CHARS;
+			}
+			if (imageReady() && (force || !hasImageTags(person))) {
+				const tagLore = await memberLoreText(person, books, options.budget.analysis);
+				if (force || !options.knownKeys.has(imageTagKey(ctx.char.chaId, person, tagLore))) {
+					result.calls++;
+					result.chars += IMAGE_TAG_PROMPT_CHARS + tagLore.length;
+				}
+			}
+		}
+		return result;
 	}
 	async function analyzeContactRaw(contact, books, options = {}) {
 		contact.analysisReused = false;
+		contact.analysisSources = findLoreEntries(contact, books).map((e) => ({
+			id: String(e.id || ""),
+			title: loreTitle(e)
+		}));
 		const usage = [];
 		const lore = await memberCardText(contact, books, options.budget?.analysis || LORE_PER_MEMBER, usage, !!options.force);
 		contact.contextUsage = usage;
@@ -8447,10 +10830,31 @@ ${lore.slice(0, 1200)}`;
 		options.knownKeys = new Set(await risuai.pluginStorage.keys() || []);
 		options.knownKeys.add(ctx.key);
 		const savedTags = imageCfg.enabled ? options.knownKeys : null;
+		const fullKeys = (person) => {
+			const entry = person.lore ? findLoreEntry(person, books) : null;
+			const all = String(entry?.key || "").split(",").map((k) => k.trim()).filter(Boolean);
+			const folder = entry?.folder ? String(entry.folder) : "";
+			let changed = false;
+			if ((person.loreFolder || "") !== folder) {
+				if (folder) person.loreFolder = folder;
+				else delete person.loreFolder;
+				changed = true;
+			}
+			if (all.some((k) => !(person.keys || []).includes(k))) {
+				person.keys = [...new Set([...person.keys || [], ...all])];
+				changed = true;
+			}
+			return changed;
+		};
+		for (const c of state.candidates || []) if (fullKeys(c)) changed = true;
 		await inPool(state.contacts, 8, async (contact) => {
 			const before = JSON.stringify(contact);
-			let applied = false;
+			let applied = fullKeys(contact);
 			const usage = [];
+			contact.analysisSources = findLoreEntries(contact, books).map((e) => ({
+				id: String(e.id || ""),
+				title: loreTitle(e)
+			}));
 			const lore = await memberCardText(contact, books, options.budget.analysis, usage);
 			contact.contextUsage = usage;
 			const matchesSource = contact.analysisLore ? contact.analysisLore === lore : contact.loreHash === loreHash(lore);
@@ -8873,7 +11277,8 @@ ${lore}`;
 - gender: girl, boy, other 중 하나.
 - looks: 바뀌지 않는 외형을 영어 Danbooru 태그로 쉼표로 나눠 쓴다. 머리색, 머리 길이와 모양, 눈색, 체형, 늘 달고 있는 장신구(헤일로, 머리장식 등). 옷과 신발은 쓰지 않는다.
 - outfit: 평소 옷차림을 영어 Danbooru 태그로 쉼표로 나눠 쓴다. 옷, 신발, 모자. 최대 15개. 로어에 쓰인 외형을 우선하고, 로어에 없으면 공식 캐릭터일 때만 널리 알려진 기본 외형으로 채운다. 표정, 자세, 배경, 이름은 쓰지 않는다. 최대 25개.
-JSON 하나만 출력한다: {"character_tags":[],"copyright":"","gender":"girl","age":"unknown","looks":"","outfit":""}
+- background: 이 인물의 프로필 사진 배경으로 어울리는 장소를 영어 Danbooru 태그로 쉼표로 나눠 3~8개 쓴다. 로어에 쓰인 그 인물의 주된 장소·분위기를 우선한다. 사람, 옷, 자세는 쓰지 않는다. 모르면 빈 문자열.
+JSON 하나만 출력한다: {"character_tags":[],"copyright":"","gender":"girl","age":"unknown","looks":"","outfit":"","background":""}
 
 [로어]
 ${lore || "(로어 항목 없음)"}`;
@@ -8901,6 +11306,7 @@ ${lore || "(로어 항목 없음)"}`;
 				"other"
 			].includes(raw.gender) ? raw.gender : "girl",
 			...splitOutfit(raw.looks, raw.outfit),
+			background: cleanTags(raw.background, 300),
 			manual: false
 		};
 	}
@@ -9126,6 +11532,15 @@ ${lore || "(로어 항목 없음)"}`;
 			}
 		};
 		if (model.includes("4-5")) parameters.skip_cfg_above_sigma = 59.04722600415217;
+		const references = /^nai-diffusion-4-5(?:-|$)/.test(model) ? options.references || [] : [];
+		if (references.length) {
+			const rows = await Promise.all(references.map(async (r) => ({
+				...r,
+				data: await referenceImageData(r.image)
+			})));
+			Object.assign(parameters, photoReferenceParameters(rows));
+			delete parameters.skip_cfg_above_sigma;
+		}
 		const body = JSON.stringify({
 			input: base,
 			model,
@@ -9147,8 +11562,17 @@ ${lore || "(로어 항목 없음)"}`;
 			...choice.coveringAdded.length ? { coveringAdded: choice.coveringAdded } : {}
 		});
 		for (let attempt = 0;; attempt++) {
+			const request = references.length ? JSON.stringify({
+				input: base,
+				model,
+				action: "generate",
+				parameters: {
+					...parameters,
+					director_reference_images: references.map(() => "(레퍼런스 이미지 본문 생략)")
+				}
+			}) : body;
 			const event = await systemStart("image-request", {
-				request: body,
+				request,
 				attempt: attempt + 1
 			});
 			try {
@@ -9230,11 +11654,21 @@ ${lore || "(로어 항목 없음)"}`;
 		const url = await risuai.pluginStorage.getItem(PHOTO_PREFIX + "full:" + id);
 		return typeof url === "string" ? url : "";
 	}
+	async function photoOriginal(id) {
+		const url = await risuai.pluginStorage.getItem(PHOTO_PREFIX + "orig:" + id);
+		return typeof url === "string" && url ? url : photoFull(id);
+	}
+	function pngDataUrl(bytes) {
+		let text = "";
+		for (let i = 0; i < bytes.length; i += 32768) text += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+		return "data:image/png;base64," + btoa(text);
+	}
 	async function deletePhotoData(id) {
 		if (!id) return;
 		thumbUrls.delete(id);
 		await risuai.pluginStorage.removeItem(PHOTO_PREFIX + "thumb:" + id);
 		await risuai.pluginStorage.removeItem(PHOTO_PREFIX + "full:" + id);
+		await risuai.pluginStorage.removeItem(PHOTO_PREFIX + "orig:" + id);
 	}
 	const photoQueue = [];
 	let photoRunning = false;
@@ -9315,7 +11749,7 @@ ${lore || "(로어 항목 없음)"}`;
 		await saveState(key);
 		render();
 	}
-	async function drawAndStoreRaw(key, state, people, sceneTags, size, outfits, r18 = false, omitLooks = {}, promptOverride = null, avoidCovering = [], extraNegative = "") {
+	async function drawAndStoreRaw(key, state, people, sceneTags, size, outfits, r18 = false, omitLooks = {}, promptOverride = null, avoidCovering = [], extraNegative = "", keepOriginal = false) {
 		if (!imageReady()) throw new Error("설정 → 사진에서 사진 기능을, 설정 → 시작 준비에서 NovelAI 키를 확인해 주세요.");
 		const missing = promptOverride ? [] : people.filter((p) => p.id !== "me" && !hasImageTags(p));
 		if (missing.length) {
@@ -9344,20 +11778,34 @@ ${lore || "(로어 항목 없음)"}`;
 			prompt.negative = [prompt.negative, ...tagList(extraNegative).filter((t) => !has.has(t.toLowerCase()))].filter(Boolean).join(", ");
 		}
 		let generation;
+		const model = promptOverride?.model || imageCfg.model;
+		const planned = /^nai-diffusion-4-5(?:-|$)/.test(model) ? promptOverride ? Array.isArray(promptOverride.references) ? promptOverride.references : [] : photoReferencePlan(people, imageCfg.reference, model) : [];
+		const references = await Promise.all(planned.map(async (r) => ({
+			...r,
+			image: await keepProfileImage(r.image, {
+				botId: view.ctx?.key === key ? view.ctx.char?.chaId : undefined,
+				contact: people.find((p) => p.id === r.who)
+			})
+		})));
 		const png = await naiGenerate(prompt, size, (request) => {
 			generation = {
 				...request,
+				references,
 				people: people.map((p) => ({
 					id: p.id,
 					name: p.name
 				}))
 			};
-		}, promptOverride ? { model: promptOverride.model } : {});
+		}, {
+			model,
+			references
+		});
 		const full = await encodeImage(png, 4096, .9);
 		const thumb = await encodeImage(png, THUMB_WIDTH, .78);
 		const id = newId();
 		await risuai.pluginStorage.setItem(PHOTO_PREFIX + "full:" + id, full.url);
 		await risuai.pluginStorage.setItem(PHOTO_PREFIX + "thumb:" + id, thumb.url);
+		if (keepOriginal) await risuai.pluginStorage.setItem(PHOTO_PREFIX + "orig:" + id, await pngDataUrl(png));
 		thumbUrls.set(id, thumb.url);
 		return {
 			id,
@@ -9365,21 +11813,92 @@ ${lore || "(로어 항목 없음)"}`;
 			h: full.h,
 			model: generation?.model || imageCfg.model,
 			style: style?.title || "",
-			generation
+			generation,
+			...keepOriginal ? { original: true } : {}
 		};
 	}
 	const drawAndStore = systemInstrument("photo", drawAndStoreRaw);
-	const PROFILE_TAGS = "portrait, upper body, looking at viewer, smile, simple background";
-	const PROFILE_NEGATIVE = "multiple views, character sheet, reference sheet, multiple girls, multiple boys, 2girls, 2boys, split screen, zoom layer";
+	const PROFILE_TAGS = "portrait, upper body, looking at viewer, smile";
+	const PROFILE_NEGATIVE = "multiple views, character sheet, reference sheet, multiple girls, multiple boys, 2girls, 2boys, split screen, zoom layer, full body, feet, sitting, squatting, crouching, knees up, from above, from below, lying";
+	const PROFILE_PLAIN = "1.4::white background, simple background ::";
+	const PROFILE_PLAIN_NEGATIVE = "detailed background, scenery, outdoors, indoors, sky, night sky, cityscape, landscape";
+	const BELOW_FRAME_RE = /\b(shoes?|footwear|heels?|heeled|boots?|socks?|toes?|ankles?|ankle \w+|garters?|garter belt|thigh ?highs?|thighhighs|thigh-high \w+|stockings?|legwear|pantyhose|tights|sandals?|loafers?|sneakers?|kneehighs?|knee highs?|leggings|barefoot|feet|foot)\b/i;
+	const belowFrame = (tag) => BELOW_FRAME_RE.test(tag);
+	const profileBgCache = new Map();
+	const profileBgKey = (botId) => PROFILE_BG_PREFIX + encodeURIComponent(botId);
+	const bgValue = (v) => v === "on" || v === "off" ? v : "";
+	async function profileBgChoices(botId) {
+		if (!profileBgCache.has(botId)) {
+			let saved = null;
+			try {
+				saved = await readJson(profileBgKey(botId));
+			} catch {
+				saved = null;
+			}
+			const people = saved?.people && typeof saved.people === "object" && !Array.isArray(saved.people) ? saved.people : {};
+			profileBgCache.set(botId, {
+				all: bgValue(saved?.all) || "off",
+				people: Object.fromEntries(Object.entries(people).filter(([, v]) => bgValue(v)))
+			});
+		}
+		return profileBgCache.get(botId);
+	}
+	async function saveProfileBg(botId, choices) {
+		await risuai.pluginStorage.setItem(profileBgKey(botId), JSON.stringify(choices));
+		profileBgCache.set(botId, choices);
+	}
+	function profileBgLoaded(botId) {
+		if (profileBgCache.has(botId)) return profileBgCache.get(botId);
+		void profileBgChoices(botId).then(() => render());
+		return null;
+	}
+	async function setProfileBg(botId, contact, value) {
+		const now = await profileBgChoices(botId), people = { ...now.people };
+		if (bgValue(value)) people[personKey(contact)] = value;
+		else delete people[personKey(contact)];
+		await saveProfileBg(botId, {
+			...now,
+			people
+		});
+	}
+	async function setBotProfileBg(botId, value) {
+		await saveProfileBg(botId, {
+			...await profileBgChoices(botId),
+			all: bgValue(value) || "off"
+		});
+	}
+	async function setAllProfileBg(botId, value) {
+		await saveProfileBg(botId, {
+			all: bgValue(value) || "off",
+			people: {}
+		});
+	}
+	const profileBgOf = (contact, choices) => choices?.people?.[personKey(contact)] || "";
+	const profileBgOn = (contact, choices) => (profileBgOf(contact, choices) || choices?.all || "off") === "on";
+	function profileRequest(contact, background) {
+		const parts = tagParts(contact.imageTags);
+		const outfit = parts.outfit.split(", ").filter((t) => t && !belowFrame(t)).join(", ");
+		const omit = parts.looks.split(", ").filter((t) => t && belowFrame(t));
+		const place = background ? cleanTags(contact.imageTags?.background, 300) : PROFILE_PLAIN;
+		return {
+			scene: [PROFILE_TAGS, place].filter(Boolean).join(", "),
+			outfits: outfit ? { [contact.id]: outfit } : {},
+			omitLooks: omit.length ? { [contact.id]: omit } : {},
+			negative: [PROFILE_NEGATIVE, background ? "" : PROFILE_PLAIN_NEGATIVE].filter(Boolean).join(", ")
+		};
+	}
 	async function drawProfile(key, state, contact) {
-		const shot = await drawAndStore(key, state, [contact], PROFILE_TAGS, PHOTO_SIZES.square, undefined, false, {}, null, [], PROFILE_NEGATIVE);
+		const ctx = view.ctx?.key === key ? view.ctx : await getContext();
+		if (!hasImageTags(contact) && ctx?.key === key) await ensureImageTags(contact, ctx, await loreBooks());
+		const background = profileBgOn(contact, ctx?.char?.chaId ? await profileBgChoices(ctx.char.chaId) : {});
+		const ask = profileRequest(contact, background);
+		const shot = await drawAndStore(key, state, [contact], ask.scene, PHOTO_SIZES.square, ask.outfits, false, ask.omitLooks, null, [], ask.negative, true);
 		contact.profileShots = [...contact.profileShots || [], {
 			...shot,
 			t: Date.now()
 		}];
-		contact.image = await avatarFrom(await photoFull(shot.id), true);
-		contact.manualImage = true;
 		await saveState(key);
+		return shot;
 	}
 	const AVATAR_SIZE = 512;
 	async function avatarFrom(url, square) {
@@ -9763,9 +12282,12 @@ ${lore || "(로어 항목 없음)"}`;
 //#region src/chat/send.js
 	const busyRooms = new Set();
 	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-	function pushMessage(room, msg) {
+	function pushMessage(room, msg, state = states.get(view.key)) {
 		room.msgs.push(msg);
-		if (room.msgs.length > MAX_ROOM_MSGS) room.msgs.splice(0, room.msgs.length - MAX_ROOM_MSGS);
+		if (room.msgs.length > MAX_ROOM_MSGS) {
+			retainRelationshipEvidence(state, room, room.msgs.slice(0, room.msgs.length - MAX_ROOM_MSGS));
+			room.msgs.splice(0, room.msgs.length - MAX_ROOM_MSGS);
+		}
 	}
 	async function requestReply(key, room) {
 		const state = states.get(key);
@@ -9796,6 +12318,7 @@ ${lore || "(로어 항목 없음)"}`;
 		try {
 			const ctx = await getContext();
 			if (!ctx || ctx.key !== key) throw new Error("다른 챗으로 이동해서 답장을 받지 못했습니다");
+			stampRelationshipMessage(lastUser, ctx.chat);
 			const at = state.timeMode === "session" ? sessionStamp(sessionTime(ctx.chat, state.timeSource)) : null;
 			if (at && lastUser && !lastUser.st) lastUser.st = at;
 			entry.bot = ctx.char.name;
@@ -9883,6 +12406,7 @@ ${lore || "(로어 항목 없음)"}`;
 					...from === "me" ? { played: true } : {},
 					...at ? { st: at } : {}
 				};
+				stampRelationshipMessage(msg, ctx.chat);
 				if (lines[i].photo) {
 					const p = lines[i].photo, ids = (o) => o && Object.fromEntries(Object.entries(o).map(([k, v]) => [storedFrom(k), v]));
 					msg.photo = {
@@ -9893,7 +12417,7 @@ ${lore || "(로어 항목 없음)"}`;
 						r18: room.r18 === true
 					};
 				}
-				pushMessage(room, msg);
+				pushMessage(room, msg, state);
 				if (!(view.open && view.screen === "room" && view.key === key && view.roomId === room.id)) room.unread = (room.unread || 0) + 1;
 				await saveState(key);
 				entry.delivered++;
@@ -10229,14 +12753,16 @@ ${text}`;
 		};
 	}
 	const manualHeadUrls = new Map();
-	async function profileImageUrl(contact) {
+	const shownPixels = (css) => Math.min(1024, Math.ceil(css * (globalThis.devicePixelRatio || 1) / 64) * 64);
+	async function profileImageUrl(contact, size = AVATAR_SIZE) {
 		const source = contact.image, crop = contact.imageCrop;
 		if (!validImageCrop(crop, source)) return headUrl(source);
 		const key = JSON.stringify([
 			source,
 			crop.x,
 			crop.y,
-			crop.zoom
+			crop.zoom,
+			size
 		]);
 		if (!manualHeadUrls.has(key)) {
 			const pending = (async () => {
@@ -10244,7 +12770,7 @@ ${text}`;
 				img.src = await imageUrl(source);
 				await img.decode();
 				const r = cropRect(img.naturalWidth, img.naturalHeight, crop);
-				return squareImage(img, r.left, r.top, r.side, AVATAR_SIZE, .9);
+				return squareImage(img, r.left, r.top, r.side, Math.max(1, Math.min(size, Math.round(r.side))), 1);
 			})();
 			manualHeadUrls.set(key, pending);
 			if (manualHeadUrls.size > 100) manualHeadUrls.delete(manualHeadUrls.keys().next().value);
@@ -10437,7 +12963,7 @@ ${text}`;
 		const mark = dot ? h("span", { class: "dot" }) : null;
 		if (mark) box.append(mark);
 		if (contact?.image) {
-			lazily(box, () => profileImageUrl(contact).then((url) => {
+			lazily(box, () => profileImageUrl(contact, shownPixels(size)).then((url) => {
 				if (!url) return;
 				box.textContent = "";
 				box.append(h("img", {
@@ -10636,6 +13162,20 @@ ${text}`;
 				...Array.isArray(g.autoCovering) ? { autoCovering: g.autoCovering.map((t) => text(t, 200)) } : {},
 				...Array.isArray(g.avoidCovering) ? { avoidCovering: selectedCovering(g.avoidCovering) } : {},
 				...Array.isArray(g.coveringAdded) ? { coveringAdded: selectedCovering(g.coveringAdded) } : {},
+				...Array.isArray(g.references) ? { references: g.references.map((r) => {
+					if (!r || ![
+						"character",
+						"character&style",
+						"style"
+					].includes(r.type) || !Number.isFinite(r.strength) || !Number.isFinite(r.fidelity)) fail("백업의 레퍼런스 정보가 잘못됐습니다.");
+					return {
+						who: r.who === "me" ? "me" : idMap.get(r.who) || "",
+						image: text(r.image, 20 * 1024 * 1024, true),
+						type: r.type,
+						strength: r.strength,
+						fidelity: r.fidelity
+					};
+				}) } : {},
 				people: (Array.isArray(g.people) ? g.people.slice(0, 100) : []).map((p) => ({
 					id: idMap.get(p.id) || "",
 					name: text(p.name, 120)
@@ -10644,7 +13184,7 @@ ${text}`;
 		};
 		const contacts = JSON.parse(JSON.stringify(current.contacts || []));
 		const rooms = JSON.parse(JSON.stringify(current.rooms || []));
-		const idMap = new Map(), incomingIds = new Set();
+		const idMap = new Map(), incomingIds = new Set(), relationshipRooms = new Map(), relationshipMessages = new Map();
 		let addedContacts = 0, addedRooms = 0, addedMessages = 0, messagesRead = 0;
 		const takenMemory = [];
 		const takeMemory = (list) => {
@@ -10665,9 +13205,11 @@ ${text}`;
 				keys: strings(raw.keys, 120)
 			};
 			if (raw.loreId !== undefined) c.loreId = text(raw.loreId, 200);
+			for (const field of ["loreIds", "loreSelection"]) if (Array.isArray(raw[field])) c[field] = raw[field].map((value) => text(value, 2e3, true));
 			const known = contacts.find((x) => resolvedPersonKey(x, [...contacts, ...data.contacts]) === resolvedPersonKey(c, [...contacts, ...data.contacts]));
 			if (known) {
 				mergeMemory(known, takeMemory(raw.memory));
+				for (const field of ["loreIds", "loreSelection"]) if (c[field] && !known[field]) known[field] = c[field];
 				idMap.set(originalId, known.id);
 				continue;
 			}
@@ -10685,6 +13227,18 @@ ${text}`;
 			const memory = takeMemory(raw.memory);
 			if (memory.length) c.memory = memory;
 			c.manualImage = raw.manualImage === true;
+			if (raw.photoReference && typeof raw.photoReference === "object" && !Array.isArray(raw.photoReference)) {
+				const r = raw.photoReference, ref = {};
+				if (typeof r.enabled === "boolean") ref.enabled = r.enabled;
+				if ([
+					"character",
+					"character&style",
+					"style"
+				].includes(r.type)) ref.type = r.type;
+				for (const k of ["strength", "fidelity"]) if (typeof r[k] === "number" && Number.isFinite(r[k])) ref[k] = r[k];
+				if (typeof r.image === "string") ref.image = text(r.image, 20 * 1024 * 1024);
+				c.photoReference = ref;
+			}
 			if (validImageCrop(raw.imageCrop, c.image)) c.imageCrop = {
 				source: c.image,
 				x: raw.imageCrop.x,
@@ -10741,6 +13295,7 @@ ${text}`;
 				rooms.push(room);
 				addedRooms++;
 			}
+			relationshipRooms.set(originalId, room.id);
 			for (let i = 0; i < raw.msgs.length; i++) {
 				if (++messagesRead > 2e4) fail("한 번에 불러올 수 있는 메시지 수를 넘었습니다.");
 				const m = raw.msgs[i];
@@ -10779,14 +13334,26 @@ ${text}`;
 				const oldId = m.id === undefined ? "index-" + i : text(m.id, 200, true);
 				const messageSource = m.importSource ? text(m.importSource, 1500, true) : source + ":" + oldId;
 				const same = (existing) => existing.from === from && existing.text === body && existing.t === t && !!existing.failed === !!m.failed;
-				if (room.msgs.some((x) => (x.importSource === messageSource || x.id === oldId) && same(x))) continue;
+				const existingMessage = room.msgs.find((x) => (x.importSource === messageSource || x.id === oldId) && same(x));
+				if (existingMessage) {
+					relationshipMessages.set(JSON.stringify([originalId, oldId]), existingMessage.id);
+					continue;
+				}
 				const id = room.msgs.some((x) => x.id === oldId) ? newId() : oldId;
+				relationshipMessages.set(JSON.stringify([originalId, oldId]), id);
 				if (m.editedAt !== undefined && (!Number.isFinite(m.editedAt) || m.editedAt < 0)) fail("메시지 수정 시간이 잘못됐습니다.");
 				room.msgs.push({
 					id,
 					from,
 					text: body,
 					t,
+					...m.relationshipAnchor && typeof m.relationshipAnchor.id === "string" && Number.isInteger(m.relationshipAnchor.index) ? { relationshipAnchor: modern && backup.chatId !== ctx.chat.id ? {
+						id: "",
+						index: -1
+					} : {
+						id: m.relationshipAnchor.id,
+						index: m.relationshipAnchor.index
+					} } : {},
 					...Number.isFinite(m.editedAt) ? { editedAt: m.editedAt } : {},
 					...m.failed === true ? { failed: true } : {},
 					...from !== "me" && m.typed === true ? {
@@ -10805,6 +13372,10 @@ ${text}`;
 			}
 			if (room.msgs.length > MAX_ROOM_MSGS) fail(`대화방 하나에 ${MAX_ROOM_MSGS}개를 넘는 메시지를 병합할 수 없습니다. 기존 기록은 바뀌지 않았습니다.`);
 			room.msgs.sort((a, b) => a.t - b.t);
+		}
+		for (const raw of data.contacts) {
+			const contact = contacts.find((c) => c.id === idMap.get(raw.id));
+			if (contact) mergeRelationships(contact, raw.relationshipHistory, idMap, relationshipRooms, relationshipMessages, !modern || backup.chatId === ctx.chat.id);
 		}
 		const importedBudget = data.contextBudget && !current.contextBudget && !single ? validateContextBudget(data.contextBudget) : null;
 		return {
@@ -10946,8 +13517,11 @@ ${text}`;
 		promise: "약속",
 		user: "사용자",
 		self: "자기 말",
+		heard: "들은 말",
 		relation: "관계",
-		photo: "사진"
+		photo: "사진",
+		open: "열린 화제",
+		story: "본편"
 	};
 	const memoryOf = (c) => Array.isArray(c?.memory) ? c.memory : [];
 	const memoryWords = (text) => [...new Set((String(text || "").match(/[가-힣a-zA-Z0-9]{2,}/g) || []).map((w) => w.replace(/(은|는|이|가|을|를|에|의|도|로|와|과|랑|하고|에서|이야|야|요)$/, "")).filter((w) => w.length >= 2 && !/^(오늘|지금|그럼|근데|그리고|그래|진짜|정말|그냥|나도|너도|우리)$/.test(w)))];
@@ -10962,51 +13536,107 @@ ${text}`;
 		};
 	}
 	function settleMemory(c) {
-		const live = memoryOf(c).filter((x) => x.type !== "fact" && !x.pinned && !x.archived).sort((a, b) => a.t - b.t);
+		const live = memoryOf(c).filter((x) => x.type !== "fact" && x.type !== "story" && !x.pinned && !x.archived).sort((a, b) => a.t - b.t);
 		for (const x of live.slice(0, Math.max(0, live.length - MEMORY_ACTIVE))) x.archived = true;
+		settleStory(c);
 	}
+	const IMPORTANCE = {
+		promise: 3,
+		open: 4,
+		relation: 1.5,
+		user: 1,
+		self: 1,
+		photo: .5,
+		story: 1
+	};
 	const memoryLabel = (x, nameOf) => x.with && nameOf ? `${MEMORY_TYPES[x.type] || "기억"} (${nameOf(x.with)} 계정의 대화)` : MEMORY_TYPES[x.type] || "기억";
-	function memoryBlocks(members, recentText, report = [], nameOf = null) {
+	const coveredStory = (x, covered) => x.type === "story" && covered?.size && (x.src || []).length && x.src.every((id) => covered.has(id));
+	function memoryBlocks(members, recentText, report = [], nameOf = null, opts = {}) {
 		const words = memoryWords(recentText);
-		const facts = [], talk = [];
-		let left = MEMORY_CHARS, recall = MEMORY_RECALL, source = 0, used = 0;
+		const limit = Number.isFinite(opts.limit) ? opts.limit : MEMORY_CHARS + MEMORY_RECALL;
+		const shown = opts.shown || {};
+		const facts = [], pools = [];
 		for (const m of members) {
 			const all = memoryOf(m);
 			const f = all.filter((x) => x.type === "fact").map((x) => "- " + x.text);
-			if (f.length) facts.push(`## ${m.name}\n${f.join("\n")}`);
-			const rows = [];
-			const live = all.filter((x) => x.type !== "fact" && !x.archived).sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.t - a.t);
-			for (const x of live) {
-				const line = `- ${memoryLabel(x, nameOf)}: ${x.text}`;
-				source += line.length + 1;
-				if (line.length + 1 > left) continue;
-				rows.push(line);
-				left -= line.length + 1;
-				used += line.length + 1;
+			if (f.length && !opts.storyOnly) facts.push(`## ${m.name}\n${f.join("\n")}`);
+			const live = all.filter((x) => x.type !== "fact" && !x.archived && !coveredStory(x, opts.covered) && (!opts.storyOnly || x.type === "story"));
+			const byNew = [...live].sort((a, b) => b.t - a.t), rank = new Map(byNew.map((x, i) => [x.id, i]));
+			const rel = (x) => words.filter((w) => x.text.includes(w)).length;
+			const items = live.map((x) => {
+				const recent = 2 * (1 - rank.get(x.id) / Math.max(1, byNew.length));
+				const score = rel(x) * 3 + (x.pinned ? 6 : IMPORTANCE[x.type] || 1) + recent - Math.min(shown[x.id] || 0, 3) * 1.2 - Math.min(x.told?.n || 0, 3) * .5;
+				return {
+					m,
+					x,
+					score,
+					old: false
+				};
+			});
+			for (const x of all.filter((x) => x.archived && !x.merged && !x.closed && !coveredStory(x, opts.covered) && (!opts.storyOnly || x.type === "story"))) {
+				const r = rel(x);
+				if (r) items.push({
+					m,
+					x,
+					score: r * 3 + .5,
+					old: true
+				});
 			}
-			const old = all.filter((x) => x.archived && !x.merged).map((x) => ({
-				x,
-				score: words.filter((w) => x.text.includes(w)).length
-			})).filter((o) => o.score).sort((a, b) => b.score - a.score || b.x.t - a.x.t);
-			for (const { x } of old) {
-				const line = `- 지난 ${memoryLabel(x, nameOf)}: ${x.text}`;
-				if (line.length + 1 > recall) continue;
-				rows.push(line);
-				recall -= line.length + 1;
-				used += line.length + 1;
+			for (const it of items) it.line = `- ${it.old ? "지난 " : ""}${memoryLabel(it.x, nameOf)}: ${it.x.text}`;
+			items.sort((a, b) => b.score - a.score || b.x.t - a.x.t);
+			pools.push({
+				m,
+				items
+			});
+		}
+		const chosen = new Set();
+		let left = limit, source = 0, used = 0;
+		const take = (it, cap) => {
+			if (chosen.has(it) || it.line.length + 1 > Math.min(cap, left)) return false;
+			chosen.add(it);
+			left -= it.line.length + 1;
+			used += it.line.length + 1;
+			return true;
+		};
+		const share = Math.floor(limit / Math.max(1, members.length));
+		for (const { items } of pools) {
+			let mine = share;
+			for (const it of items) {
+				source += it.line.length + 1;
+				if (take(it, mine)) mine -= it.line.length + 1;
 			}
-			if (rows.length) talk.push(`## ${m.name}\n${rows.join("\n")}`);
+		}
+		for (const it of pools.flatMap((p) => p.items).sort((a, b) => b.score - a.score)) take(it, left);
+		const talk = [], story = {};
+		for (const { m, items } of pools) {
+			const mine = items.filter((it) => chosen.has(it)).sort((a, b) => a.x.t - b.x.t);
+			const lines = (list, head) => list.length ? `${head}\n${list.map((it) => it.line).join("\n")}` : "";
+			const conv = mine.filter((it) => it.x.type !== "story" && it.x.type !== "open" && !it.old);
+			const parts = [
+				m.feeling?.text ? `지금 ${m.name}의 마음: ${m.feeling.text}` : "",
+				m.chatNow?.text && opts.mainEnd !== undefined && m.chatNow.anchor >= opts.mainEnd ? `메신저에서 마지막으로 말한 지금${opts.roomId && m.chatNow.roomId && m.chatNow.roomId !== opts.roomId && m.chatNow.t > (opts.roomLastT ?? Infinity) ? "(다른 방에서 말함, 이 방의 마지막 대화 뒤)" : ""}: ${m.chatNow.text}` : "",
+				lines(conv.filter((it) => it.x.told?.n), "이미 서로 아는 것 (다시 설명하지 않는다. 필요하면 짧게 이어서 말한다):"),
+				lines(conv.filter((it) => !it.x.told?.n), "아직 꺼내지 않은 것:"),
+				lines(mine.filter((it) => it.x.type === "open" && !it.x.dropped), "열린 화제 (답을 못 들었거나 남은 일. 먼저 꺼낼 수 있다. 사용자가 이 화제에 답하지 않고 다른 이야기로 넘어갔으면 꺼내지 않는다. 사용자가 다시 꺼내면 이어서 답한다):"),
+				lines(mine.filter((it) => it.x.type === "open" && it.x.dropped), "사용자가 다른 이야기로 넘어간 화제 (먼저 꺼내지 않는다. 사용자가 다시 꺼내면 이어서 답한다):"),
+				lines(mine.filter((it) => it.old && it.x.type !== "story"), "대화와 관련해 떠오른 지난 기억:")
+			].filter(Boolean);
+			if (parts.length) talk.push(`## ${m.name}\n${parts.join("\n")}`);
+			const lived = mine.filter((it) => it.x.type === "story").map((it) => "- " + it.x.text);
+			if (lived.length || m.storyNow?.text) story[m.id] = [...lived, ...m.storyNow?.text ? [opts.storyEnd !== undefined && m.storyNow.at !== undefined && m.storyNow.at < opts.storyEnd ? `지금(본편에서 마지막으로 나온 장면 기준. 그 뒤 장면에는 나오지 않음): ${m.storyNow.text}` : `지금: ${m.storyNow.text}`] : []];
 		}
 		report.push({
 			section: "chatMemory",
 			sourceChars: source,
 			usedChars: used,
-			limit: MEMORY_CHARS + MEMORY_RECALL,
+			limit,
 			truncated: used < source
 		});
 		return {
 			facts: facts.join("\n\n"),
-			talk: talk.join("\n\n")
+			talk: talk.join("\n\n"),
+			story,
+			chosen: [...chosen].map((it) => it.x.id)
 		};
 	}
 	function memoryPending(room) {
@@ -11047,7 +13677,7 @@ ${text}`;
 		};
 		let changed = 0;
 		for (const a of Array.isArray(raw.add) ? raw.add.slice(0, 30) : []) {
-			const text = clean(a?.text), type = Object.hasOwn(MEMORY_TYPES, a?.type) && a.type !== "fact" ? a.type : "self";
+			const text = clean(a?.text), type = Object.hasOwn(MEMORY_TYPES, a?.type) && a.type !== "fact" && a.type !== "story" ? a.type : "self";
 			if (!text) continue;
 			const to = [...new Set(owners(a.who))];
 			if (!to.length && members.length === 1) to.push(members[0]);
@@ -11060,9 +13690,19 @@ ${text}`;
 		for (const u of Array.isArray(raw.update) ? raw.update : []) {
 			const hit = editable(u?.id), text = clean(u?.text);
 			if (!hit || !text) continue;
+			const retype = ![
+				"fact",
+				"story",
+				"open"
+			].includes(hit.x.type) && Object.hasOwn(MEMORY_TYPES, u?.type) && ![
+				"fact",
+				"story",
+				"open"
+			].includes(u.type) ? { type: u.type } : {};
 			Object.assign(hit.x, {
 				text,
-				t: Date.now()
+				t: Date.now(),
+				...retype
 			});
 			changed++;
 		}
@@ -11088,6 +13728,68 @@ ${text}`;
 			});
 			changed++;
 		}
+		for (const id of Array.isArray(raw.told) ? raw.told.slice(0, 30) : []) {
+			for (const m of members) {
+				const x = memoryOf(m).find((y) => y.id === id && y.type !== "fact" && y.type !== "story");
+				if (!x) continue;
+				x.told = {
+					n: (x.told?.n || 0) + 1,
+					t: Date.now()
+				};
+				changed++;
+			}
+		}
+		for (const o of Array.isArray(raw.open) ? raw.open.slice(0, 10) : []) {
+			const text = clean(o?.text);
+			if (!text) continue;
+			const to = [...new Set(owners(o.who))];
+			if (!to.length && members.length === 1) to.push(members[0]);
+			for (const m of to) {
+				if (memoryOf(m).some((x) => x.text === text)) continue;
+				m.memory = [...memoryOf(m), newMemory("open", text, "model", where)];
+				changed++;
+			}
+		}
+		for (const id of Array.isArray(raw.dropped) ? raw.dropped.slice(0, 10) : []) {
+			const hit = editable(typeof id === "string" ? id : id?.id);
+			if (!hit || hit.x.type !== "open" || hit.x.archived || hit.x.dropped) continue;
+			hit.x.dropped = { t: Date.now() };
+			changed++;
+		}
+		for (const r of Array.isArray(raw.close) ? raw.close : []) {
+			const hit = editable(typeof r === "string" ? r : r?.id);
+			if (!hit || hit.x.type !== "open" || hit.x.archived) continue;
+			const text = clean(r?.text);
+			Object.assign(hit.x, {
+				archived: true,
+				closed: true,
+				...text ? { text } : {}
+			});
+			changed++;
+		}
+		const anchor = [...room.msgs || []].reverse().find((m) => m.relationshipAnchor)?.relationshipAnchor?.index ?? -1;
+		for (const n of Array.isArray(raw.now) ? raw.now.slice(0, 12) : []) {
+			const [m] = owners(n?.who);
+			const text = clean(n?.text);
+			if (!m || !text) continue;
+			m.chatNow = {
+				text,
+				t: Date.now(),
+				anchor,
+				roomId: room.id
+			};
+			changed++;
+		}
+		for (const f of Array.isArray(raw.feeling) ? raw.feeling : []) {
+			const [m] = owners(f?.who);
+			const text = clean(f?.text).slice(0, 120);
+			if (!m || !text || m.feeling?.text === text) continue;
+			m.feeling = {
+				text,
+				t: Date.now()
+			};
+			changed++;
+		}
 		for (const m of members) settleMemory(m);
 		return changed;
 	}
@@ -11109,12 +13811,21 @@ ${text}`;
 		const owner = room.as ? state.contacts.find((c) => c.id === room.as)?.name || "알 수 없음" : "";
 		const name = (id) => id === "me" ? pcName : state.contacts.find((c) => c.id === id)?.name || "알 수 없음";
 		const promptId = promptIds(members, pcName);
+		let relationshipContext = members.some((m) => m.relationshipHistory?.length) ? await getContext() : null;
+		if (relationshipContext?.key !== key) relationshipContext = null;
+		const currentRelation = relationshipContext ? relationshipBlock(members, state, relationshipContext.chat, room.as || "me") : "";
 		const known = members.map((m) => {
 			const facts = memoryOf(m).filter((x) => x.type === "fact").map((x) => `- 설정: ${x.text}`);
-			const rows = memoryOf(m).filter((x) => x.type !== "fact" && !x.archived).map((x) => `- [${x.id}] ${MEMORY_TYPES[x.type]}: ${x.text}${x.pinned || x.by === "user" ? " (고정)" : ""}`);
-			return `### ${m.name} (ID ${promptId(m)})\n${[...facts, ...rows].join("\n") || "- (없음)"}`;
+			const rows = memoryOf(m).filter((x) => x.type !== "fact" && x.type !== "story" && !x.archived).map((x) => `- [${x.id}] ${MEMORY_TYPES[x.type]}: ${x.text}${x.pinned || x.by === "user" ? " (고정)" : ""}${x.told?.n ? ` (이미 나눈 이야기 ${x.told.n}번)` : ""}${x.type === "open" && x.dropped ? " (사용자가 넘어감)" : ""}`);
+			const now = [...m.feeling?.text ? [`- 지금 마음: ${m.feeling.text}`] : [], ...m.chatNow?.text ? [`- 메신저 속 지금: ${m.chatNow.text}`] : []];
+			return `### ${m.name} (ID ${promptId(m)})\n${[
+				...facts,
+				...now,
+				...rows
+			].join("\n") || "- (없음)"}`;
 		}).join("\n\n");
 		const log = batch.map((m) => `${name(m.from)}: ${factsOnly(m) ? "(사실만) " : ""}${photoLine(m)}`).join("\n");
+		const labeledLog = batch.map((m) => `[message:${m.id}] ${name(m.from)}: ${factsOnly(m) ? "(사실만) " : ""}${photoLine(m)}`).join("\n");
 		const names = [pcName, ...state.contacts.flatMap((c) => [c.name, ...c.aliases || []])].filter(Boolean);
 		const prompt = `메신저 대화를 보고 각 인물의 대화 메모리를 정리한다.
 ${owner ? `이 방은 ${owner} 계정으로 나눈 대화다. 사용자 ${pcName}은(는) 이 방에 없다.` : `사용자: ${pcName} (ID me)`}
@@ -11122,30 +13833,54 @@ ${owner ? `이 방은 ${owner} 계정으로 나눈 대화다. 사용자 ${pcName
 이름 표기: ${[...new Set(names)].slice(0, 60).join(", ")}
 
 할 일:
-- add: 나중 대화에 영향을 줄 새 사실만 추가한다. type은 promise(약속), user(${owner ? "대화 상대에 대해 알게 된 것" : "사용자에 대해 알게 된 것"}), self(자기가 한 말·한 일·밝힌 사실), relation(관계·감정의 변화), photo(보낸 사진과 그때 옷차림) 중 하나다.
-- update: 이미 있는 메모리의 사실이 바뀌었으면 그 ID의 문장을 고친다.
+- add: 나중 대화에 영향을 줄 새 사실만 추가한다. type은 promise(약속), user(${owner ? "대화 상대에 대해 알게 된 것" : "사용자에 대해 알게 된 것"}), self(자기가 한 말·한 일·밝힌 사실), heard(다른 참가자가 한 말·밝힌 사실을 그 인물이 듣고 알게 된 것), relation(관계·감정의 변화), photo(보낸 사진과 그때 옷차림) 중 하나다. 다른 사람이 한 말은 self가 아니라 heard다.
+- update: 이미 있는 메모리의 사실이 바뀌었으면 그 ID의 문장을 고친다. 종류가 잘못 저장된 메모리(예: 다른 사람이 한 말이 자기 말로 저장됨)는 type에 맞는 종류를 함께 써서 고친다.
 - merge: 같은 인물의 비슷한 메모리 여러 개를 한 문장으로 합친다.
 - archive: 지킨 약속, 더는 맞지 않는 사실처럼 지금은 덜 중요한 메모리를 보관으로 옮긴다. 필요하면 text로 "지킨 약속: ..."처럼 고쳐 쓴다. 지우지 않는다.
+- told: [새 대화]에서 그 인물이 이미 있는 메모리의 내용을 다시 말하거나 다시 꺼냈으면 그 메모리 ID를 넣는다.
+- open: 답을 못 들은 질문, 아직 지키지 않은 약속, 하려다 못 한 말처럼 아직 열려 있는 화제를 추가한다.
+- close: 열린 화제가 [새 대화]에서 해결됐으면 그 ID와 "해결: ..." 문장을 쓴다.
+- dropped: 열린 화제에 사용자가 답하지 않고 다른 이야기로 넘어갔으면 그 ID를 넣는다. 해결된 화제는 close에 쓴다. 이미 (사용자가 넘어감) 표시가 있는 화제는 넣지 않는다.
+- feeling: 참가자마다 지금 대화 상대를 어떻게 느끼는지 한 줄. 지금 마음과 달라졌을 때만 쓴다.
+- now: 참가자가 [새 대화]에서 자기가 지금 있는 곳이나 하는 일을 말했으면 가장 나중 것을 한 줄로 쓴다. 말하지 않았으면 쓰지 않는다.
+- relationships: 대화에서 성립하거나 변경된 상대별 현재 상태다. who는 참가자 ID, target은 사용자면 me 또는 상대 인물 이름/ID, at은 근거 message ID다. relation(관계), feeling(감정), promises(유효한 약속 목록)를 독립적으로 다루고 바뀐 항목만 쓴다. 약속이 모두 해소됐으면 promises:[]다. 관계 종류는 서술문으로 쓰고 미리 정한 단계에 맞추지 않는다. 순간적인 감정만으로 관계를 바꾸거나, 관계만으로 감정을 추정하지 않는다. 변화가 없으면 빈 배열이다.
+${relationshipInstructions}
 규칙:
 - 인사, 맞장구, 그 자리에서 끝난 잡담은 쓰지 않는다. 간식, 잠깐 자리 비움, 방금 한 행동처럼 그날 안에 끝나는 일도 쓰지 않는다. 며칠 뒤 대화에도 영향을 줄 것만 쓴다. 새로 정리할 것이 없으면 모두 빈 배열이다.
-- 이미 있는 메모리와 같은 내용은 다시 add하지 않는다. (고정) 표시와 설정 항목은 고치거나 합치거나 보관하지 않는다.
-- who는 그 일을 직접 보고 들은 참가자 ID 배열이다. 단톡방이면 기억해야 할 사람을 모두 쓴다.
-- text는 한국어 한 문장, 80자 안팎이다. 누가 무엇을 했는지 분명히 쓰고, ${owner ? "사람은 이름으로" : `사용자는 "${pcName}"(으)로`} 부른다. 이름은 위 이름 표기를 글자 그대로 쓰고, 다른 고유명사는 대화에 나온 표기를 따른다.
+- 이미 있는 메모리와 같은 내용은 다시 add하지 않는다. 같은 인물이 이미 한 말이나 같은 화제를 되풀이했으면 add하지 않고 그 메모리 ID를 told에 넣는다. (고정) 표시와 설정 항목은 고치거나 합치거나 보관하지 않는다.
+- who는 그 일을 직접 보고 들은 참가자 ID 하나다. 단톡방에서 여러 명이 기억해야 하면 사람마다 따로 add한다.
+- text는 한국어 한 문장, 80자 안팎이다. who 인물의 1인칭 시점("나는 …")으로 무엇을 했는지 분명히 쓰고, ${owner ? "다른 사람은 이름으로" : `사용자는 "${pcName}"(으)로`} 부른다.${owner ? "" : " " + nameParticles(pcName)} 이름은 위 이름 표기를 글자 그대로 쓰고, 다른 고유명사는 대화에 나온 표기를 따른다.
 - 대화에 없는 일을 지어내지 않는다.${batch.some(factsOnly) ? "\n- (사실만)이 붙은 메시지는 문장이나 말투를 옮겨 쓰지 않고, 그 사람이 한 일·약속·밝힌 사실만 정리한다." : ""}
-JSON 하나만 출력한다: {"add":[{"who":["참가자 ID"],"type":"promise","text":""}],"update":[{"id":"메모리 ID","text":""}],"merge":[{"ids":["메모리 ID","메모리 ID"],"text":""}],"archive":[{"id":"메모리 ID","text":""}]}
+JSON 하나만 출력한다: {"add":[{"who":["참가자 ID"],"type":"promise","text":""}],"update":[{"id":"메모리 ID","text":"","type":"종류가 잘못됐을 때만"}],"merge":[{"ids":["메모리 ID","메모리 ID"],"text":""}],"archive":[{"id":"메모리 ID","text":""}],"told":["메모리 ID"],"open":[{"who":["참가자 ID"],"text":""}],"close":[{"id":"메모리 ID","text":""}],"dropped":["메모리 ID"],"feeling":[{"who":"참가자 ID","text":""}],"now":[{"who":"참가자 ID","text":""}],"relationships":[{"who":"참가자 ID","target":"me","at":"근거 message ID","relation":"변경된 관계"}]}
 
 [참가자와 지금 메모리]
 ${known}
+${currentRelation ? `\n[현재 관계]\n${currentRelation}\n` : ""}
 
 [새 대화]
-${log}`;
+${labeledLog}`;
 		const raw = parseCard(await askModel([{
 			role: "user",
 			content: prompt
 		}], null, "memory"));
 		if (!raw) throw new Error("메모리 정리 응답을 해석하지 못했습니다");
 		const before = new Map(members.flatMap((c) => memoryOf(c).map((x) => [x.id, memoryFields(x)])));
-		const changed = applyMemory(state, room, members, raw, log + "\n" + known, names);
+		const PERSON_STATE = ["feeling", "chatNow"];
+		const stateBefore = new Map(members.map((c) => [c.id, Object.fromEntries(PERSON_STATE.map((k) => [k, c[k] ? JSON.stringify(c[k]) : null]))]));
+		let changed = applyMemory(state, room, members, raw, log + "\n" + known, names);
+		if (Array.isArray(raw.relationships) && raw.relationships.length) {
+			changed += applyRelationships(state, raw.relationships, {
+				kind: "chat",
+				roomId: room.id,
+				messages: batch.map((m) => ({
+					id: m.id,
+					text: String(m.text || ""),
+					anchor: m.relationshipAnchor,
+					order: m.t || 0
+				})),
+				members: members.map((m) => m.id)
+			}, pcName);
+		}
 		const ops = [];
 		for (const c of members) for (const x of memoryOf(c)) {
 			const was = before.get(x.id);
@@ -11157,6 +13892,15 @@ ${log}`;
 				c: c.id,
 				id: x.id,
 				before: was
+			});
+		}
+		for (const c of members) for (const k of PERSON_STATE) {
+			const was = stateBefore.get(c.id)[k], now = c[k] ? JSON.stringify(c[k]) : null;
+			if (was !== now) ops.push({
+				c: c.id,
+				state: k,
+				before: was,
+				after: now
 			});
 		}
 		state.memSeq = (state.memSeq || 0) + 1;
@@ -11202,7 +13946,10 @@ ${log}`;
 		"text",
 		"t",
 		"archived",
-		"merged"
+		"merged",
+		"told",
+		"closed",
+		"dropped"
 	];
 	const memoryFields = (x) => Object.fromEntries(MEMORY_FIELDS.map((k) => [k, x[k]]));
 	const keptMemory = (x) => x.type === "fact" || x.pinned || x.by === "user";
@@ -11247,9 +13994,17 @@ ${log}`;
 		else delete room.memUpTo;
 	}
 	function rewindMemory(state, plan, gone) {
+		for (const { room, k } of plan.rooms) rewindRelationships(state, room.id, room.memRuns.slice(k).flatMap((run) => run.msgs));
 		const runs = plan.rooms.flatMap(({ room, k }) => room.memRuns.slice(k)).sort((a, b) => b.seq - a.seq);
 		for (const run of runs) for (const op of [...run.ops].reverse()) {
 			const c = state.contacts.find((y) => y.id === op.c);
+			if (op.state) {
+				if (c && (c[op.state] ? JSON.stringify(c[op.state]) : null) === op.after) {
+					if (op.before) c[op.state] = JSON.parse(op.before);
+					else delete c[op.state];
+				}
+				continue;
+			}
 			const x = c && memoryOf(c).find((y) => y.id === (op.add || op.id));
 			if (!x || keptMemory(x)) continue;
 			if (op.add) c.memory = memoryOf(c).filter((y) => y !== x);
@@ -11342,6 +14097,19 @@ ${log}`;
 			return starts.length ? `${m.name}: ${[...new Set(starts)].map((s) => `"${s}"`).join(", ")}` : "";
 		}).filter(Boolean).join("\n");
 	}
+	function recentEndings(room, members) {
+		return members.map((m) => {
+			const ends = [];
+			const msgs = (room.msgs || []).filter((x) => x.text && !factsOnly(x));
+			for (let i = 0; i < msgs.length; i++) {
+				if (msgs[i].from !== m.id || msgs[i + 1]?.from === m.id) continue;
+				const sentences = msgs[i].text.trim().split(/(?<=[.?!…。])\s+/).filter(Boolean);
+				ends.push(sentences.at(-1).slice(-40));
+			}
+			const last = [...new Set(ends.slice(-4))];
+			return last.length ? `${m.name}: ${last.map((s) => `"${s}"`).join(", ")}` : "";
+		}).filter(Boolean).join("\n");
+	}
 	function modeRules(mode, storyIn, timeNow = { mode: "off" }) {
 		const time = {
 			story: "- 답장 시점은 아래 줄거리의 맨 끝이다. 메신저는 본편 장면 속에서 주고받는 문자이며, 줄거리에서 일어난 일과 각 인물이 실제로 아는 것만 반영한다.",
@@ -11359,96 +14127,37 @@ ${log}`;
 			"- 가장 최근 메시지에 먼저 답한다. 이미 끝난 화제나 지난 메시지를 다시 붙잡지 않는다.",
 			"- 직전 답장들과 같은 말로 시작하거나 같은 문장 틀을 되풀이하지 않는다."
 		];
-		if (mode !== "story") rules.push("- 답장마다 새로운 것을 하나 더한다: 자기 근황, 감정, 질문, 제안 중 하나. 받기만 하지 말고 대화를 이어 간다.");
+		if (mode !== "story") rules.push("- 답장마다 새로운 것을 하나 더한다: 자기 근황, 감정, 질문, 제안 중 하나. 직전 답장들과 매번 같은 종류를 고르지 않는다. 받기만 하지 말고 대화를 이어 간다. 답장을 부탁·당부로 연달아 끝내지 않는다.");
 		if (mode === "free") rules.push("- 대화가 끊길 것 같으면 그 인물답게 먼저 새 화제를 꺼낸다.");
 		if (timeNow.mode === "session") rules.push("- 대화 기록의 [본편 시점: …] 줄은 그 아래 메시지를 주고받은 본편 시점이다.");
 		if (timeNow.mode === "real") rules.push("- [현재 시각]은 사용자의 실제 현재 시각이다. 대화 기록의 (… 뒤) 표시는 메시지 사이에 실제로 흐른 시간이다. 인사와 근황을 이 시간에 맞춘다.");
 		if (timeNow.mode === "off" && storyIn) rules.push("- 줄거리 속 상태창의 날짜·시각 표기는 메신저 답장의 시간 판단에 쓰지 않는다.");
 		return rules.join("\n");
 	}
-	const STORY_VIEW_CHARS = 2e3;
-	const storyViewJobs = new WeakMap();
-	const storyWriting = new Set();
-	const textSig = (s) => {
-		let h = 5381;
-		for (let i = 0; i < s.length; i++) h = h * 33 + s.charCodeAt(i) | 0;
-		return (h >>> 0).toString(36) + ":" + s.length;
-	};
-	async function storyViews(state, members, story, pcName, report, counterpart = null, onAsk = null) {
-		const sig = textSig(story);
-		const views = state.storyViews && typeof state.storyViews === "object" ? state.storyViews : {};
-		state.storyViews = views;
-		const slot = (m) => counterpart ? `${m.id}>${counterpart.id}` : m.id;
-		const missing = members.filter((m) => views[slot(m)]?.sig !== sig);
-		const other = counterpart ? counterpart.name : pcName;
-		if (missing.length) {
-			onAsk?.();
-			let jobs = storyViewJobs.get(state);
-			if (!jobs) storyViewJobs.set(state, jobs = new Map());
-			const jobKeys = new Map(missing.map((m) => [m, JSON.stringify([
-				story,
-				pcName,
-				counterpart?.id ?? null,
-				other,
-				m.id,
-				m.name,
-				m.aliases || []
-			])]));
-			const jobKey = (m) => jobKeys.get(m);
-			const fresh = missing.filter((m) => !jobs.has(jobKey(m)));
-			if (fresh.length) {
-				const task = (async () => {
-					const prompt = `아래 [본편 줄거리]는 모든 장면을 보는 서술자의 기록이다. 각 인물이 실제로 알 수 있는 것만 남긴 줄거리를 인물마다 따로 쓴다.
-사용자: ${pcName}
-인물: ${fresh.map((m) => m.name).join(", ")}
-규칙:
-- 그 인물이 그 자리에 있어 직접 보고 들은 일과, 줄거리 안에서 누군가에게 말로 전해 들은 일만 쓴다.
-- 그 인물이 없던 장면, 다른 인물의 속마음, 서술자만 아는 묘사와 설명은 쓰지 않는다.
-- 시간 순서대로 짧게 쓴다. 고유명사는 줄거리 표기를 그대로 쓰고, 줄거리에 없는 일을 지어내지 않는다.
-- 마지막 줄은 "지금: "으로 시작해 줄거리 끝에서 그 인물이 어디서 무엇을 하는지, ${other}와(과) 같은 장소에 있는지 쓴다. 같은 장소에 없으면 ${other}의 지금 위치·소지품·행동 중 그 인물이 직접 보거나 전해 듣지 않은 것은 모른다고 쓴다.
-- 그 인물이 줄거리에 나오지 않으면 "(직접 겪은 장면 없음)"과 "지금: 줄거리에 나오지 않음"만 쓴다.
-- 인물당 ${STORY_VIEW_CHARS}자 이내.
-JSON 하나만 출력한다: {"views":[{"who":"인물 이름","text":"그 인물이 아는 줄거리"}]}
-
-[본편 줄거리]
-${story}`;
-					const raw = parseCard(await askModel([{
-						role: "user",
-						content: prompt
-					}], null, "story-view"));
-					const list = Array.isArray(raw?.views) ? raw.views : [];
-					const result = new Map();
-					for (const m of fresh) {
-						const hit = list.find((v) => typeof v?.who === "string" && findMember([m], v.who));
-						if (typeof hit?.text !== "string" || !hit.text.trim()) throw new Error(`${m.name}의 인물별 줄거리를 받지 못했습니다`);
-						result.set(m.id, {
-							sig,
-							text: hit.text.trim().slice(0, STORY_VIEW_CHARS),
-							t: Date.now()
-						});
-					}
-					for (const m of fresh) views[slot(m)] = result.get(m.id);
-					return result;
-				})().finally(() => {
-					for (const m of fresh) if (jobs.get(jobKey(m)) === task) jobs.delete(jobKey(m));
-				});
-				for (const m of fresh) jobs.set(jobKey(m), task);
-			}
-			const results = await Promise.all(missing.map((m) => jobs.get(jobKey(m)).then((result) => [slot(m), result.get(m.id)])));
-			for (const [key, result] of results) views[key] = result;
-			state.storyViews = views;
+	const VOICE_LINE_CHARS = 200;
+	function voiceBlock(members, summaryLines, report) {
+		const parts = [];
+		let chars = 0;
+		for (const m of members) {
+			const recent = (Array.isArray(m.storyLines) ? m.storyLines : []).slice(0, 2);
+			const older = (summaryLines?.[m.id] || []).filter((t) => !recent.includes(t)).slice(-2);
+			const lines = [...recent, ...older].map((t) => t.length > VOICE_LINE_CHARS ? t.slice(0, VOICE_LINE_CHARS) + "…" : t);
+			if (!lines.length) continue;
+			const text = `## ${m.name}\n대사:\n${lines.map((t) => `- "${t}"`).join("\n")}`;
+			chars += text.length;
+			parts.push(text);
 		}
-		const text = members.map((m) => `## ${m.name}\n${views[slot(m)].text}`).join("\n\n");
 		report.push({
-			section: "storyView",
-			sourceChars: story.length,
-			usedChars: text.length,
-			limit: STORY_VIEW_CHARS * members.length,
-			truncated: false,
-			cached: !missing.length
+			section: "voice",
+			sourceChars: chars,
+			usedChars: chars,
+			limit: members.length * VOICE_LINE_CHARS * 4,
+			truncated: false
 		});
-		return text;
+		return parts.join("\n\n");
 	}
+	const storyWriting = new Set();
+	const relationshipWriting = new Set();
 	async function buildReplyMessages(ctx, state, room, report = []) {
 		const pcName = await parseCbs("{{user}}");
 		const actor = lastTyped(room)?.from || ownerOf(room);
@@ -11473,6 +14182,34 @@ ${story}`;
 		const description = budgetText(cleanStory(await parseCbs(ctx.char.desc)), budget.description, "description", report);
 		const lastMine = lastTyped(room)?.text;
 		const lore = await memberLore(ctx, members, lastMine, state, report, room);
+		const relationshipsReady = (async () => {
+			if (state.newMemory !== true || !members.some((c) => c.relationshipSeed?.schema !== 1)) return;
+			const token = ctx.key + "|" + room.id;
+			relationshipWriting.add(token);
+			render();
+			try {
+				const initialized = await initializeRelationships(ctx, state, members, pcName);
+				report.push({
+					section: "relationshipInit",
+					called: initialized.called,
+					usedChars: 0,
+					sourceChars: 0,
+					truncated: false
+				});
+				if (states.get(ctx.key) === state) await saveState(ctx.key);
+			} catch (e) {
+				report.push({
+					section: "relationshipInit",
+					usedChars: 0,
+					sourceChars: 0,
+					truncated: false,
+					error: e.message
+				});
+			} finally {
+				relationshipWriting.delete(token);
+				render();
+			}
+		})();
 		const actorLore = actorContact ? await memberLore(ctx, [actorContact], lastMine, state, report, room) : "";
 		const { text: story, ids: recentIds } = storyIn ? await storyWindow(ctx, plan.story) : {
 			text: "",
@@ -11485,23 +14222,26 @@ ${story}`;
 			limit: plan.story,
 			truncated: false
 		});
-		let storyView = "";
+		let storyRead = false, storyCovered = null;
 		if (storyIn && story.trim()) {
 			const writing = ctx.key + "|" + room.id;
 			try {
-				storyView = await storyViews(state, people, story, pcName, report, asUser ? null : {
-					id: actor,
-					name: actorName
-				}, () => {
+				const waiting = await storyPlan(ctx, state, plan.story);
+				noteStoryBacklog(state, waiting);
+				const latest = waiting.latest ?? waiting.batches[0] ?? [];
+				if (latest.length) {
 					storyWriting.add(writing);
 					render();
-				});
+					await readStory(ctx.key, state, latest, members, pcName);
+				}
+				storyRead = true;
+				storyCovered = waiting.covered;
 			} catch (e) {
 				report.push({
-					section: "storyView",
+					section: "storyMemory",
 					sourceChars: story.length,
 					usedChars: 0,
-					limit: STORY_VIEW_CHARS * people.length,
+					limit: plan.story,
 					truncated: false,
 					error: e.message
 				});
@@ -11509,9 +14249,11 @@ ${story}`;
 				if (storyWriting.delete(writing)) render();
 			}
 		}
+		await relationshipsReady;
 		const useMemory = state.newMemory === true;
-		const remembered = storyIn && state.useSummary && useMemory ? await storyMemory(ctx, members, recentIds, plan.summary, state.storySource || "auto") : null;
-		const summary = remembered ? remembered.text : storyIn && state.useSummary ? await legacySummary(ctx, members, recentIds) : "";
+		const summaryRecent = storyRead ? new Set() : recentIds;
+		const remembered = storyIn && state.useSummary && useMemory ? await storyMemory(ctx, members, summaryRecent, plan.summary, state.storySource || "auto", { resolve: makeResolver(namePeople(state.contacts, state.candidates, personKey)) }) : null;
+		const summary = remembered ? remembered.text : storyIn && state.useSummary ? await legacySummary(ctx, members, summaryRecent) : "";
 		if (remembered) {
 			state.lastStoryMemory = {
 				source: remembered.source,
@@ -11529,12 +14271,35 @@ ${story}`;
 		}
 		const log = roomLog(state, room, pcName, budget.roomHistory, report, timeNow);
 		const nameOf = (id) => state.contacts.find((c) => c.id === id)?.name || "알 수 없음";
-		const memo = useMemory ? memoryBlocks(members, room.msgs.slice(-6).map((m) => m.text).join("\n"), report, nameOf) : {
+		const memo = useMemory || storyRead ? memoryBlocks(members, room.msgs.slice(-6).map((m) => m.text).join("\n"), report, nameOf, {
+			limit: budget.memory,
+			covered: storyCovered,
+			shown: room.memShown || {},
+			storyOnly: !useMemory,
+			storyEnd: storyEnd(ctx.chat),
+			mainEnd: (ctx.chat.message || []).length - 1,
+			roomId: room.id,
+			roomLastT: (room.msgs || []).filter((m) => m.from !== "me" && !m.failed).at(-1)?.t ?? 0
+		}) : {
 			facts: "",
-			talk: ""
+			talk: "",
+			story: {},
+			chosen: []
 		};
+		room.memShown = Object.fromEntries((memo.chosen || []).map((id) => [id, ((room.memShown || {})[id] || 0) + 1]));
+		const storyView = storyRead ? members.map((m) => `## ${m.name}\n${(memo.story[m.id] || ["(본편에서 직접 겪은 일이 아직 없음)"]).join("\n")}`).join("\n\n") : "";
+		const voice = storyIn ? voiceBlock(members, remembered?.lines, report) : "";
 		const actorFacts = actorContact && useMemory ? memoryBlocks([actorContact], "", [], nameOf).facts : "";
+		const relationships = relationshipBlock(members, state, ctx.chat, actor);
+		if (relationships) report.push({
+			section: "relationships",
+			sourceChars: relationships.length,
+			usedChars: relationships.length,
+			limit: relationships.length,
+			truncated: false
+		});
 		const openings = recentOpenings(room, members);
+		const endings = recentEndings(room, members);
 		const typedOnly = room.msgs.some(factsOnly);
 		const photoRule = imageReady() ? `
 사진:
@@ -11555,20 +14320,24 @@ ${imageCfg.ask === "easy" || room.r18 === true ? "- 쉬움 또는 정조대 OFF�
 - 요청이 없으면 "imageRequest":{"requested":false}다.
 - 요청이 있으면 "imageRequest":{"requested":true,"from":"보내는 참가자 ID","who":["보이는 참가자 ID"],"tags":"영어 장면 태그","outfit":{"참가자 ID":"요청한 옷 태그"},"omitLooks":{"참가자 ID":["이번 사진에서 제외할 저장 장식 태그 원문"]},"avoidCovering":["선택한 가림 억제 태그"]}다. 기존 사진 규칙의 인물·구도·태그·의상·가림 억제 선택 형식을 따른다. 보통 설정에서 messages의 photo를 쓰는 경우에도 photo.avoidCovering에 같은 선택을 넣는다. 태그가 부족하면 현재 맥락으로 보완한다. 방 밖 인물이나 me를 who에 넣지 않는다.
 ${imageCfg.ask === "easy" || room.r18 === true ? "- 이 방에서는 이미지 요청이 확인되면 코드가 사진 메시지를 먼저 만든다. requested=true여도 messages에 사진 뒤에 보낼 그 인물다운 짧은 답장을 반드시 작성하고 imageRequest의 태그도 완성한다. messages에 사진을 중복해서 넣지 않는다. 인물의 망설임이나 과거 거절은 요청이 없다는 근거가 아니다." : "- 보통 설정에서는 인물이 전송 여부를 판단하고, 보내기로 했다면 기존 messages의 photo 형식을 쓴다. 요청 판정은 전송 여부와 별개로 기록한다."}
-출력 예시 구조: {"imageRequest":{"requested":false},${storyIn ? "\"presence\":[{\"from\":\"참가자 ID\",\"withUser\":\"같이 있음 또는 떨어져 있음\",\"knows\":\"사용자에 대해 직접 알 수 있는 것\"}]," : ""}"messages":[{"from":"참가자 ID","to":["me"],"text":"답장"}]}.
+출력 예시 구조: {"imageRequest":{"requested":false},${storyIn ? "\"presence\":[{\"from\":\"참가자 ID\",\"withUser\":\"같이 있음 또는 떨어져 있음\",\"knows\":\"사용자에 대해 직접 알 수 있는 것\",\"repeats\":\"이 방에서 이미 여러 번 한 말·당부 (없으면 빈 문자열)\"}]," : ""}"messages":[{"from":"참가자 ID","to":["me"],"text":"답장"}]}.
 ` : "";
 		const system = `너는 RP의 보조 작가다. 아래 줄거리와 설정을 바탕으로 휴대폰 메신저 답장만 쓴다.
 ${room.type === "group" ? `지금은 단톡방 "${room.name}"이다. 참가자: ${names.join(", ")}. 대화에 끼어들 만한 사람만 답한다. 다른 참가자가 이미 한 말과 같은 반응이나 같은 논지는 되풀이하지 않고, 참가자마다 자기 성격대로 다른 태도를 보인다. 할 말이 없는 사람은 답하지 않아도 된다.` : `지금은 ${names[0]}와(과) ${actorName}의 1:1 대화다.`}
 이 방의 콘텐츠 설정: ${room.r18 === true ? "정조대 OFF. 이 방의 로컬 콘텐츠 제한을 해제한 상태다. 사용자가 요청한 성인 대상 표현 범위를 적용한다. 인물은 사용자의 요청에 협력하는 태도를 유지하고, 성격은 말투로 표현하되 같은 핑계로 대화를 막지 않는다. 요청하지 않은 수위를 덧붙이지 않는다. 대화 기록에 설정이 바뀐 표시가 있으면 그 이후부터 이 설정을 따른다. 바뀌기 전 메시지에서 거절하거나 선을 그었더라도 같은 이유로 다시 거절하지 않는다." : "정조대 ON (기본). 일반 대화와 사진을 기준으로 한다. 성적인 화제가 나오면 그 인물답게 가볍게 받아넘기거나 수위를 낮춰 답하고, 훈계하거나 대화를 차갑게 끊지 않는다. 대화 기록에 설정이 바뀐 표시가 있으면 그 이후부터 이 설정을 따른다."}
 규칙:
 - 각 인물의 정체, 종족, 소속, 직업, 나이대, 말투는 맨 아래 [참가자 설정]${useMemory ? "과 [설정 메모리]" : ""}가 가장 우선이다. 줄거리나 봇 설명과 다르면 이것을 따른다.
-- 받은 메시지가 [참가자 설정]과 맞지 않는 전제를 깔면 그대로 맞장구치지 말고 그 인물답게 바로잡는다. 모르는 일을 지어내지 않고, 다른 신분이나 소속을 말하면 자기 것을 밝힌다.
+- 받은 메시지가 ${relationships ? "[참가자 설정]과 [현재 관계]에" : "[참가자 설정]과"} 맞지 않는 전제를 깔면 그대로 맞장구치지 말고 그 인물답게 바로잡는다. 모르는 일을 지어내지 않고, 다른 신분이나 소속을 말하면 자기 것을 밝힌다.
+${relationships ? "- 관계·감정·약속은 [현재 관계]가 예전 관계 설명·태도와 다른 경우 현재 관계를 우선한다. 관계가 변했다고 감정까지 같다고 추정하거나, 순간적인 감정으로 관계가 끝났다고 추정하지 않는다. 기본 성격과 말투, 과거 대사 예시는 현재 관계 안에서 표현하며 예전 태도를 복구하는 근거로 쓰지 않는다. 사용자가 명시한 [설정 메모리]의 사실은 현재 관계보다 우선하고 추측으로 뒤집지 않는다.\n" : ""}
 ${modeRules(mode, storyIn, timeNow)}${useMemory ? "\n- [본편 메모리]와 [대화 메모리]가 서로 다르면 시간상 나중에 일어난 일을 따른다. 각 인물은 자기 메모리에 있는 일만 안다." : ""}
 - 줄거리나 설정상 아는 사이가 아니고 만난 적도 없으면 모르는 사람에게 연락받은 듯 반응한다.
 - 사용자가 같은 부탁이나 제안을 다시 하면 같은 이유로 또 미루거나 거절하지 않는다. 그 인물답게 받아 주거나, 조건을 걸고 응하거나, 다른 방식으로 이어 간다. 정말 할 수 없는 일이면 거절은 한 번만 하고 화제를 넘긴다.
 - 메신저 문자로 주고받는 대화다. 본편에서 지금 같은 장소에 함께 있는 인물만 사용자의 표정·안색·자세를 볼 수 있다. 떨어져 있으면 문자, 보낸 사진, 사용자가 말해 준 것으로만 상대 상태를 안다.${storyIn ? `
-- 줄거리는 모든 장면을 보는 서술자의 기록이다. 각 인물은 자기가 그 자리에 있던 장면과 문자·사진·전해 들은 말로 받은 것만 안다. 자기가 없던 장면의 일은 모른다.${storyView ? "\n- [최근 줄거리]는 인물마다 그 인물이 직접 보고 들은 것만 정리한 것이다. 각 인물은 자기 몫에 있는 일만 알고, 다른 인물 몫에만 있는 일은 모른다." : ""}
+- 줄거리는 모든 장면을 보는 서술자의 기록이다. 각 인물은 자기가 그 자리에 있던 장면과 문자·사진·전해 들은 말로 받은 것만 안다. 자기가 없던 장면의 일은 모른다.${storyView ? "\n- [최근 줄거리]는 인물마다 그 인물이 본편에서 직접 겪은 일(그 인물의 기억)과 지금 있는 곳이다. 각 인물은 자기 몫에 있는 일만 알고, 다른 인물 몫에만 있는 일은 모른다." : ""}
 - 답장을 쓰기 전에 presence에 인물마다 본편의 지금 장면에서 사용자와 같은 장소에 있는지(withUser)와, 그 인물이 사용자에 대해 직접 보거나 들어서 아는 것(knows)을 적는다.
+- 같이 있음은 본편의 가장 최근 장면에 그 인물이 사용자와 함께 나오거나, 이 메신저 대화에서 만나기로 하고 실제로 만났다고 말한 뒤일 때만 쓴다. 그 밖에 메신저 대화의 느낌이나 [최근 줄거리]의 지난 장면만으로 같은 곳에 있다고 짐작하지 않는다. 같이 있음 판단에는 이 방에서 예전에 자기가 한 말을 근거로 쓰지 않는다.
+- [대화 메모리]의 메신저에서 마지막으로 말한 지금에 '이 방의 마지막 대화 뒤'라고 적혀 있으면, 그 인물의 지금 있는 곳과 하는 일은 이 방의 대화 기록보다 그것을 따른다.
+- repeats에는 그 인물이 이 방의 대화 기록에서 이미 여러 번 한 말이나 당부를 적는다. 표현이 조금 달라도 같은 내용이면 같은 것으로 본다. repeats에 적은 말과 당부는 사용자가 먼저 꺼내지 않으면 이번 답장에서 다시 하지 않는다.
 - withUser가 떨어져 있음인 인물은 사용자의 위치, 소지품, 행동, 주변 상황, 소리를 보거나 들은 것처럼 말하지 않는다. knows에 없는 것을 아는 듯이 말하지 않는다.` : ""}
 ${asUser ? "" : `- [상대: ${actorName}]의 설정은 참고용이다. 각 인물은 줄거리와 관계상 ${actorName}에 대해 알 만한 것만 아는 듯이 말한다.
 ${userPlays ? `- ${pcName}도 이 방의 참가자로서 답한다. [참가자 설정]의 ${pcName} 설정과 말투를 따른다.` : `- ${pcName}은(는) 이 방에 없고 이 대화를 보지 않는다.`}
@@ -11578,7 +14347,7 @@ ${userPlays ? `- ${pcName}도 이 방의 참가자로서 답한다. [참가자 �
 - 한국어로 쓴다. 인물당 1~3줄.
 - 고유명사는 [참가자 설정]의 표기를 글자 그대로 쓴다.
 출력 형식은 한 줄에 하나씩 정확히 다음과 같다:
-JSON 하나: {${storyIn ? "\"presence\":[{\"from\":\"참가자 ID\",\"withUser\":\"같이 있음 또는 떨어져 있음\",\"knows\":\"사용자에 대해 직접 알 수 있는 것\"}]," : ""}"messages":[{"from":"참가자 ID","to":["me"],"text":"답장"}]}
+JSON 하나: {${storyIn ? "\"presence\":[{\"from\":\"참가자 ID\",\"withUser\":\"같이 있음 또는 떨어져 있음\",\"knows\":\"사용자에 대해 직접 알 수 있는 것\",\"repeats\":\"이 방에서 이미 여러 번 한 말·당부 (없으면 빈 문자열)\"}]," : ""}"messages":[{"from":"참가자 ID","to":["me"],"text":"답장"}]}
 ${photoRule}
 ${imageDecisionRule}
 ${imageReady() ? `[저장된 외형 태그 · 이번 사진의 장식 유지 여부 판단에 참고]\n${members.map((m) => `${promptId(m)}: ${tagParts(m.imageTags).looks || "(미등록)"}`).join("\n")}` : ""}
@@ -11594,7 +14363,8 @@ ${description}
 ${summary ? `${useMemory ? "[본편 메모리 - 앞선 줄거리 요약]" : "[앞선 줄거리 요약]"}\n${summary}\n\n` : ""}${storyView ? `[최근 줄거리 - 인물마다 그 인물이 직접 보고 들은 것만]\n${storyView}\n\n` : storyIn ? `[최근 줄거리]\n${story}\n\n` : ""}[참가자 설정]
 ${members.filter((m) => m.bio).map((m) => `${m.name}의 한줄 소개: ${spell(m.bio)}`).join("\n")}
 ${userPlays ? `## ${pcName}${state.meBio ? `\n한줄 소개: ${state.meBio}` : ""}\n${persona || "(없음)"}\n\n` : ""}${lore || "(없음)"}
-${memo.facts ? `\n[설정 메모리 - 사용자가 확정한 사실. 다른 메모리와 줄거리보다 우선]\n${memo.facts}\n` : ""}
+${memo.facts ? `\n[설정 메모리 - 사용자가 확정한 사실. 다른 메모리와 줄거리보다 우선]\n${memo.facts}\n` : ""}${voice ? `\n[말투 기준 - 이 RP에서 실제로 쓴 말. 말투 참고용]\n${voice}\n` : ""}
+${relationships ? `\n[현재 관계 - 본편과 대화의 근거 순서로 반영한 현재 상태]\n${relationships}\n` : ""}
 [현재 메신저 방: 코드가 정한 경계]
 ${asUser ? `사용자 ID는 me, 이름은 ${pcName}이다. 사용자는 로어의 동료·가족·주인공과 자동으로 동일한 사람이 되지 않는다.` : `상대 ID는 me, 이름은 ${actorName}이다.`}
 답장을 보낼 수 있는 ID: ${JSON.stringify(people.map((m) => ({
@@ -11609,7 +14379,7 @@ ${members.map((m) => m.userAddress ? `${m.name}가 현재 사용자에게 쓸 �
 		const user = `${memo.talk ? `[대화 메모리 - 이 챗의 메신저에서 생긴 일. 각 인물은 자기 것만 안다]\n${memo.talk}\n\n` : ""}${timeNow.mode === "session" ? `[본편의 지금]\n${stampText(timeNow.now)}\n\n` : timeNow.mode === "real" ? `[현재 시각]\n${realNow()}\n\n` : ""}[이 방의 대화 기록]
 ${log}
 
-${openings ? `[최근 첫마디 - 이 말로 다시 시작하지 않는다]\n${openings}\n\n` : ""}위 기록의 마지막 메시지에 대한 답장을 지금 출력한다.${imageReady() ? " 사용자에게 보여 줄 답장과 별개로 imageRequest에 이미지 요청의 문맥 판정을 반드시 포함한다." : ""}`;
+${openings ? `[최근 첫마디 - 이 말로 다시 시작하지 않는다]\n${openings}\n\n` : ""}${endings ? `[최근 끝맺음 - 같은 말이나 같은 당부로 다시 끝내지 않는다]\n${endings}\n\n` : ""}위 기록의 마지막 메시지에 대한 답장을 지금 출력한다.${imageReady() ? " 사용자에게 보여 줄 답장과 별개로 imageRequest에 이미지 요청의 문맥 판정을 반드시 포함한다." : ""}`;
 		globalThis.__interludeLastPrompt = {
 			system: system.length,
 			user: user.length,
@@ -11851,7 +14621,7 @@ ${openings ? `[최근 첫마디 - 이 말로 다시 시작하지 않는다]\n${o
 		let left = MEMORY_INJECT;
 		const hidden = new Set(state.rooms.filter((r) => r.inject === false).map((r) => r.id));
 		for (const c of state.newMemory ? state.contacts : []) {
-			const items = memoryOf(c).filter((x) => x.type !== "fact" && !x.archived && !hidden.has(x.roomId)).sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.t - a.t);
+			const items = memoryOf(c).filter((x) => x.type !== "fact" && x.type !== "story" && !x.archived && !hidden.has(x.roomId)).sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.t - a.t);
 			for (const x of items) {
 				const line = x.with ? `- ${c.name} (${state.contacts.find((y) => y.id === x.with)?.name || "?"} 계정의 대화): ${x.text}` : `- ${c.name}: ${x.text}`;
 				if (line.length + 1 > left) break;
