@@ -1,7 +1,7 @@
 //@name interlude
-//@display-name Interlude v1.4.2
+//@display-name Interlude v1.4.3
 //@api 3.0
-//@version 1.4.2
+//@version 1.4.3
 //@update-url https://raw.githubusercontent.com/Nicered/interlude-risu/main/interlude.js
 //@arg model_slot string 쓸 모델. aux는 Risu 보조 모델, main은 Risu 메인 모델입니다.
 //@arg nai_key string NovelAI API 키 (사진 기능). Interlude 설정 → 시작 준비에서 입력합니다.
@@ -188,7 +188,7 @@
 
 //#endregion
 //#region src/core/constants.js
-	const PLUGIN_VERSION = "1.4.2";
+	const PLUGIN_VERSION = "1.4.3";
 	const STORE_PREFIX = "interlude:v1:";
 	const STORY_CHARS = 16e3;
 	const SUMMARY_CHARS = 6e3;
@@ -230,6 +230,62 @@
 	const THUMB_CACHE = 300;
 	const NAI_ENDPOINT = "https://image.novelai.net/ai/generate-image";
 	const NAI_SUGGEST = "https://image.novelai.net/ai/generate-image/suggest-tags";
+
+//#endregion
+//#region src/people/who.js
+	const namesOf = (c) => [...new Set([
+		c.name,
+		...c.aliases || [],
+		...(c.keys || []).filter((k) => !String(k).trim().startsWith("/")),
+		c.card?.["이름"]
+	].filter((n) => typeof n === "string").map(normalize).filter((n) => n.length >= 2))];
+	function makeResolver(people) {
+		const owners = new Map(), names = new Map();
+		for (const c of people) {
+			if (!c?.id) continue;
+			const list = namesOf(c);
+			names.set(c.id, list);
+			for (const n of list) {
+				if (!owners.has(n)) owners.set(n, new Set());
+				owners.get(n).add(c.id);
+			}
+		}
+		const folderOf = new Map(people.filter((c) => c?.id && c.loreFolder).map((c) => [c.id, c.loreFolder]));
+		const only = (name) => {
+			const ids = owners.get(normalize(name));
+			return ids?.size === 1 ? [...ids][0] : null;
+		};
+		const cache = new Map();
+		const resolve = (name, others = [], text = null) => {
+			const n = normalize(name);
+			const ids = owners.get(n);
+			if (!ids) return null;
+			if (ids.size === 1) return [...ids][0];
+			const candidates = [...ids];
+			const key = n + "\n" + others.map(normalize).sort().join(",");
+			if (!cache.has(key)) {
+				const nearFolders = new Set(others.filter((o) => normalize(o) !== n).map(only).filter(Boolean).map((id) => folderOf.get(id)).filter(Boolean));
+				const inFolder = nearFolders.size ? candidates.filter((id) => nearFolders.has(folderOf.get(id))) : [];
+				cache.set(key, inFolder.length === 1 ? inFolder[0] : null);
+			}
+			const byFolder = cache.get(key);
+			if (byFolder || !text) return byFolder;
+			const body = normalize(text());
+			const hits = candidates.filter((id) => (names.get(id) || []).some((x) => x !== n && owners.get(x)?.size === 1 && body.includes(x)));
+			return hits.length === 1 ? hits[0] : null;
+		};
+		resolve.owned = (name) => owners.has(normalize(name));
+		return resolve;
+	}
+	function namePeople(contacts, candidates, keyOf) {
+		const seen = new Set((contacts || []).map(keyOf));
+		return [...contacts || [], ...(candidates || []).filter((c) => {
+			const k = keyOf(c);
+			if (seen.has(k)) return false;
+			seen.add(k);
+			return true;
+		})];
+	}
 
 //#endregion
 //#region src/syslog/log.js
@@ -596,59 +652,567 @@
 	}
 
 //#endregion
-//#region src/people/who.js
-	const namesOf = (c) => [...new Set([
-		c.name,
-		...c.aliases || [],
-		...(c.keys || []).filter((k) => !String(k).trim().startsWith("/")),
-		c.card?.["이름"]
-	].filter((n) => typeof n === "string").map(normalize).filter((n) => n.length >= 2))];
-	function makeResolver(people) {
-		const owners = new Map(), names = new Map();
-		for (const c of people) {
-			if (!c?.id) continue;
-			const list = namesOf(c);
-			names.set(c.id, list);
-			for (const n of list) {
-				if (!owners.has(n)) owners.set(n, new Set());
-				owners.get(n).add(c.id);
+//#region src/compat/dusk.js
+	const USER = /\{\{user\}\}/gi;
+	const withUser = (text, pcName) => pcName ? String(text).replace(USER, pcName) : String(text);
+	const DUSK_INDEX = "dusk.mem.v3.index";
+	const DUSK_FOLDER = "dusk.mem.v3.f.";
+	const CELLAR_STATE = "dusk.cellar.mem";
+	const CELLAR_QUEUE = "dusk.cellar.queue";
+	const CELLAR_ON = "dusk.cellar.on";
+	const CELLAR_TIMEOUT = 4e3;
+	const CELLAR_REUSE = 5e3;
+	const DUSK_SPEECH = /^\s*([^:\n]{1,40}):\s*"([\s\S]+)"\s*$/;
+	const parsed = new Map();
+	function storedJson(key, raw) {
+		if (raw == null || raw === "") return null;
+		if (typeof raw !== "string") return raw;
+		const hit = parsed.get(key);
+		if (hit && hit.raw === raw) return hit.value;
+		let value;
+		try {
+			value = JSON.parse(raw);
+		} catch {
+			value = null;
+		}
+		parsed.set(key, {
+			raw,
+			value
+		});
+		return value;
+	}
+	const localItem = async (key) => storedJson(key, await risuai.pluginStorage.getItem(key));
+	const withTimeout = (promise, ms) => new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error("timeout")), ms);
+		Promise.resolve(promise).then((v) => {
+			clearTimeout(timer);
+			resolve(v);
+		}, (e) => {
+			clearTimeout(timer);
+			reject(e);
+		});
+	});
+	async function responseJson(res) {
+		try {
+			if (typeof res?.json === "function") return await res.json();
+		} catch {}
+		try {
+			const t = typeof res?.text === "function" ? await res.text() : res?.body ?? res?.data;
+			return typeof t === "string" ? JSON.parse(t) : t;
+		} catch {
+			return null;
+		}
+	}
+	const cellarReads = new Map();
+	async function cellarItem(key) {
+		const state = await localItem(CELLAR_STATE).catch(() => null);
+		if (!state?.on || !state.url) return undefined;
+		if (await risuai.pluginStorage.getItem(CELLAR_ON) === "0") return undefined;
+		const queue = await localItem(CELLAR_QUEUE).catch(() => null);
+		const waiting = Array.isArray(queue) ? queue.find((q) => q?.key === key) : null;
+		if (waiting) return storedJson("queue:" + key, waiting.value);
+		const hit = cellarReads.get(key);
+		if (hit && Date.now() - hit.t < CELLAR_REUSE) return hit.value;
+		const url = String(state.url).replace(/\/+$/, "") + "/cellar/mem/" + encodeURIComponent(key);
+		let value;
+		try {
+			const request = state.via === "fetch" && typeof fetch === "function" ? fetch(url, {
+				method: "GET",
+				cache: "no-store"
+			}) : risuai.nativeFetch(url, { method: "GET" });
+			const res = await withTimeout(request, CELLAR_TIMEOUT);
+			const status = Number(res?.status) || 0;
+			if (status === 404) value = null;
+			else {
+				const json = await responseJson(res);
+				value = status === 200 && json?.ok ? storedJson("cellar:" + key, json.value) : undefined;
+			}
+		} catch {
+			value = undefined;
+		}
+		if (value !== undefined) cellarReads.set(key, {
+			t: Date.now(),
+			value
+		});
+		return value;
+	}
+	const chatKeys = (chat) => [chat.risupotWikiScopeId, chat.id].filter((k) => typeof k === "string" || typeof k === "number").map((k) => String(k).trim()).filter(Boolean);
+	async function duskChat(ctx) {
+		const index = await localItem(DUSK_INDEX);
+		if (index?.v !== 3 || !index.folders || typeof index.folders !== "object") return {
+			index: null,
+			folder: null
+		};
+		const chaId = String(ctx.char.chaId);
+		const entries = Object.entries(index.folders);
+		const id = chatKeys(ctx.chat).map((k) => entries.find(([, f]) => String(f?.chaId) === chaId && String(f?.chatId) === k)?.[0]).find(Boolean);
+		if (!id) return {
+			index,
+			folder: null
+		};
+		const remote = await cellarItem(DUSK_FOLDER + id);
+		const folder = remote === undefined ? await localItem(DUSK_FOLDER + id) : remote;
+		return {
+			index,
+			folder: folder?.v === 3 ? folder : null
+		};
+	}
+	async function duskFolder(ctx) {
+		return (await duskChat(ctx)).folder;
+	}
+	const presentIds = (ctx) => new Set((ctx.chat.message || []).map((m) => m.chatId).filter(Boolean));
+	function forgotten(r, now, after) {
+		if (!after || r.pin || r.user || r.g !== "D" && r.g !== "C") return false;
+		if ((r.m ?? 1) > 1 && r.g === "C") return false;
+		if (r.at == null) return false;
+		return now - Math.max(r.at ?? -1, r.lm ?? -1, r.lu ?? -1) > after * (r.g === "C" ? 2 : 1);
+	}
+	async function duskEvents(ctx, recentIds) {
+		const { index, folder } = await duskChat(ctx);
+		if (!folder) return [];
+		const inject = index?.settings?.inject && typeof index.settings.inject === "object" ? index.settings.inject : {};
+		const plus = inject.plus !== false, forgetAfter = inject.forgetAfter ?? 150, now = (ctx.chat.message || []).length;
+		const present = presentIds(ctx);
+		const keep = (x) => x && !x.orphan && x.valid !== false && (!x.mid || present.has(x.mid) && !recentIds.has(x.mid));
+		const out = [];
+		const allScenes = Array.isArray(folder.scenes) ? folder.scenes : [];
+		const sceneImports = new Set(allScenes.map((s) => s?.imp).filter(Boolean));
+		for (const s of allScenes.filter(keep)) {
+			const body = String(s.sum || "").trim();
+			if (!body) continue;
+			const facts = (Array.isArray(s.facts) ? s.facts : []).map((f) => String(f || "").trim()).filter(Boolean);
+			const lines = facts.map((f) => f.match(DUSK_SPEECH)).filter(Boolean).map((m) => ({
+				speaker: m[1].trim(),
+				text: m[2].trim()
+			}));
+			const rest = facts.filter((f) => !DUSK_SPEECH.test(f));
+			const when = [s.when, s.place].filter(Boolean).join(" · ");
+			const text = [body, ...rest].join(" / ");
+			out.push({
+				text: when ? `- ${when}: ${text}` : `- ${text}`,
+				who: Array.isArray(s.who) ? s.who.map(normalize) : [],
+				kind: "event",
+				lines,
+				src: s.mid ? [s.mid] : [],
+				important: s.pin === true,
+				t: Number(s.at_ms) || 0
+			});
+		}
+		const shared = new Map();
+		for (const p of Object.values(folder.people && typeof folder.people === "object" ? folder.people : {})) {
+			const name = String(p?.name || "").trim();
+			if (!name || (p.ctx ?? "auto") === "never") continue;
+			const digest = p.digest && !p.digestStale ? String(p.digest).trim() : "";
+			if (digest) out.push({
+				text: `- ${name} 요약: ${digest}`,
+				who: [normalize(name)],
+				kind: "event",
+				lines: [],
+				src: [],
+				important: p.pinned === true,
+				t: Math.max(0, ...(Array.isArray(p.records) ? p.records : []).filter((r) => r?.digested).map((r) => Number(r.at_ms) || 0))
+			});
+			for (const r of (Array.isArray(p.records) ? p.records : []).filter(keep)) {
+				const act = String(r.act || "").trim();
+				if (!act || r.imp && sceneImports.has(r.imp)) continue;
+				if (digest && r.digested && (r.g === "D" || r.g === "C")) continue;
+				if (plus && forgotten(r, now, forgetAfter)) continue;
+				const key = (r.imp || "") + "\n" + act;
+				const seen = shared.get(key);
+				if (seen) {
+					if (!seen.who.includes(normalize(name))) seen.who.push(normalize(name));
+					seen.important ||= r.pin === true;
+					continue;
+				}
+				const e = {
+					text: r.when ? `- ${r.when}: ${act}` : `- ${act}`,
+					who: [normalize(name)],
+					kind: r.imp ? "facts" : "event",
+					lines: [],
+					src: r.mid ? [r.mid] : [],
+					important: r.pin === true,
+					t: Number(r.at_ms) || 0
+				};
+				shared.set(key, e);
+				out.push(e);
 			}
 		}
-		const folderOf = new Map(people.filter((c) => c?.id && c.loreFolder).map((c) => [c.id, c.loreFolder]));
-		const only = (name) => {
-			const ids = owners.get(normalize(name));
-			return ids?.size === 1 ? [...ids][0] : null;
-		};
-		const cache = new Map();
-		const resolve = (name, others = [], text = null) => {
-			const n = normalize(name);
-			const ids = owners.get(n);
-			if (!ids) return null;
-			if (ids.size === 1) return [...ids][0];
-			const candidates = [...ids];
-			const key = n + "\n" + others.map(normalize).sort().join(",");
-			if (!cache.has(key)) {
-				const nearFolders = new Set(others.filter((o) => normalize(o) !== n).map(only).filter(Boolean).map((id) => folderOf.get(id)).filter(Boolean));
-				const inFolder = nearFolders.size ? candidates.filter((id) => nearFolders.has(folderOf.get(id))) : [];
-				cache.set(key, inFolder.length === 1 ? inFolder[0] : null);
+		const pcName = String(await parseCbs("{{user}}") || "").trim();
+		for (const e of out) {
+			e.text = withUser(e.text, pcName);
+			e.who = e.who.map((w) => w === normalize("{{user}}") && pcName ? normalize(pcName) : w);
+			for (const l of e.lines) {
+				l.speaker = withUser(l.speaker, pcName);
+				l.text = withUser(l.text, pcName);
 			}
-			const byFolder = cache.get(key);
-			if (byFolder || !text) return byFolder;
-			const body = normalize(text());
-			const hits = candidates.filter((id) => (names.get(id) || []).some((x) => x !== n && owners.get(x)?.size === 1 && body.includes(x)));
-			return hits.length === 1 ? hits[0] : null;
-		};
-		resolve.owned = (name) => owners.has(normalize(name));
-		return resolve;
+		}
+		return out.map((e, i) => ({
+			e,
+			i
+		})).sort((a, b) => a.e.t - b.e.t || a.i - b.i).map(({ e }) => {
+			delete e.t;
+			return e;
+		});
 	}
-	function namePeople(contacts, candidates, keyOf) {
-		const seen = new Set((contacts || []).map(keyOf));
-		return [...contacts || [], ...(candidates || []).filter((c) => {
-			const k = keyOf(c);
-			if (seen.has(k)) return false;
-			seen.add(k);
-			return true;
-		})];
+	function duskCoveredIds(folder, hypaChunks = null) {
+		const ids = new Set();
+		for (const h of Array.isArray(folder?.done) ? folder.done : []) {
+			const s = String(h || "");
+			if (!s.startsWith("mid:")) continue;
+			const cut = s.lastIndexOf(":");
+			if (cut > 4) ids.add(s.slice(4, cut));
+		}
+		const add = (x) => {
+			if (x && !x.orphan && x.mid) ids.add(x.mid);
+		};
+		(Array.isArray(folder?.scenes) ? folder.scenes : []).forEach(add);
+		for (const p of Object.values(folder?.people && typeof folder.people === "object" ? folder.people : {})) (Array.isArray(p?.records) ? p.records : []).forEach(add);
+		if (folder?.cursor?.mid) ids.add(folder.cursor.mid);
+		if (hypaChunks) {
+			const copied = new Set();
+			const note = (x) => {
+				if (x && !x.orphan && typeof x.imp === "string" && x.imp.startsWith("hypaplus:")) copied.add(x.imp.slice(9, x.imp.lastIndexOf(":")));
+			};
+			(Array.isArray(folder?.scenes) ? folder.scenes : []).forEach(note);
+			for (const p of Object.values(folder?.people && typeof folder.people === "object" ? folder.people : {})) (Array.isArray(p?.records) ? p.records : []).forEach(note);
+			for (const chunk of copied) for (const id of hypaChunks.get(chunk) || []) ids.add(id);
+		}
+		return ids;
+	}
+	const obj = (v) => v && typeof v === "object" && !Array.isArray(v) ? v : {};
+	function duskMemoryOn(index, chaId) {
+		const settings = obj(index?.settings);
+		if (settings.backend === "off" || obj(settings.inject).on === false) return false;
+		return obj(index?.bots)[String(chaId)]?.on !== false;
+	}
+	const EMO = {
+		trust: "신뢰",
+		affection: "호감",
+		hostility: "적대",
+		dependence: "의존",
+		respect: "존중",
+		fear: "두려움"
+	};
+	const TONE = {
+		formal: "존댓말",
+		casual: "반말",
+		mixed: "존댓말·반말 섞음"
+	};
+	const OPEN_KIND = {
+		promise: "약속",
+		foreshadow: "복선",
+		question: "의문"
+	};
+	const STAGE = {
+		"just met": "처음 만난 사이",
+		acquaintances: "아는 사이",
+		close: "가까운 사이",
+		"very close": "아주 가까운 사이"
+	};
+	const COOL_HALF = {
+		hostility: 80,
+		fear: 120,
+		dependence: 240,
+		affection: 400
+	};
+	const COOL_FLOOR = {
+		hostility: .3,
+		fear: .3,
+		dependence: .5,
+		affection: .6
+	};
+	const ABSENT = /(사망|죽|숨졌|전사|처형|살해|소멸|실종|행방불명|떠났|떠남|이탈|탈퇴|추방|dead|died|killed|deceased|missing|gone|left)/i;
+	const BACK = /(회복|살아|생존|귀환|돌아|부활|되살|alive|returned|revived|recovered)/i;
+	const nameKey = (s) => String(s ?? "").toLowerCase().replace(/\s+/g, "");
+	const clean = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+	const pairKey = (a, b) => [nameKey(a), nameKey(b)].sort().join("|");
+	const list = (v) => Array.isArray(v) ? v : [];
+	const values = (v) => v && typeof v === "object" ? Object.values(v) : [];
+	const usable = (r) => r && !r.orphan && r.valid !== false;
+	const reach = (r) => Math.max(r.at ?? -1, r.lm ?? -1, r.lu ?? -1);
+	function cooled(entry, now) {
+		const out = {};
+		for (const [tag, v] of Object.entries(obj(entry?.tags))) {
+			out[tag] = v;
+			if (v == null || !COOL_HALF[tag] || entry.lock?.[tag] || !Number.isFinite(now)) continue;
+			let set = null;
+			for (let i = list(entry.log).length - 1; i >= 0; i--) {
+				const l = entry.log[i];
+				if (l.orphan || l.why === "cooled" || l.t?.[tag] == null) continue;
+				set = l.at == null ? null : {
+					v: l.t[tag],
+					at: l.at
+				};
+				break;
+			}
+			if (!set || now <= set.at) continue;
+			const floor = Math.round(set.v * COOL_FLOOR[tag]);
+			out[tag] = Math.min(v, Math.max(0, Math.round(floor + (set.v - floor) * Math.pow(.5, (now - set.at) / COOL_HALF[tag]))));
+		}
+		return out;
+	}
+	function stageOf(folder, a, b, now) {
+		const s = nameKey(a), o = nameKey(b);
+		const pair = (x, y) => nameKey(x) === s && nameKey(y) === o || nameKey(x) === o && nameKey(y) === s;
+		const shared = list(folder.scenes).filter((h) => !h.orphan && list(h.who).some((g) => nameKey(g) === s) && list(h.who).some((g) => nameKey(g) === o)).length;
+		let warmth = 0;
+		for (const e of values(folder.emo)) if (pair(e.from, e.to)) {
+			const t = cooled(e, now);
+			warmth = Math.max(warmth, t.affection ?? 0, t.trust ?? 0);
+		}
+		let bonds = list(folder.bonds).filter((h) => pair(h.a, h.b)).length;
+		for (const r of values(folder.rels)) if (pair(r.from, r.to)) bonds += list(r.items).filter((g) => !g.orphan).length;
+		if (values(folder.talk).some((h) => pair(h.from, h.to) && h.tone === "casual")) bonds += 2;
+		const by = shared + bonds <= 1 && warmth < 3 ? "just met" : shared < 5 || warmth < 4 ? "acquaintances" : warmth < 7 ? "close" : "very close";
+		const level = folder.start?.[[s, o].sort().join("|")]?.level;
+		const order = [
+			"just met",
+			"acquaintances",
+			"close",
+			"very close"
+		];
+		return {
+			stage: order[Math.max(order.indexOf(by), level === "close" ? 2 : level === "friendly" ? 1 : 0)],
+			shared,
+			warmth
+		};
+	}
+	function duskRelationLines(ctx, folder, names, settings = {}, userNames = [], roomPeople = names) {
+		if (!folder) return "";
+		const inject = obj(settings.inject);
+		const plus = inject.plus !== false, human = plus && inject.human !== false, cool = inject.cool !== false;
+		const set = new Set(names.map(nameKey).filter(Boolean));
+		for (const u of userNames) if (nameKey(u)) set.add(nameKey(u));
+		const members = new Set(names.map(nameKey).filter(Boolean));
+		const has = (n) => set.has(nameKey(n));
+		const member = (n) => members.has(nameKey(n));
+		const both = (a, b) => has(a) && has(b);
+		const present = presentIds(ctx);
+		const valid = (x) => !x?.orphan && (!x?.src?.chatId || present.has(x.src.chatId));
+		const now = (ctx.chat.message || []).length;
+		const latest = (x) => Number(x?.at_ms) || 0;
+		const people = values(folder.people).filter((p) => (p?.ctx ?? "auto") !== "never");
+		const scene = list(folder.scenes).filter((s) => !s?.orphan).at(-1);
+		const sections = [];
+		const section = (title, rows) => {
+			if (rows.length) sections.push(`${title}\n${rows.join("\n")}`);
+		};
+		const regress = folder.regress;
+		if (regress?.person) {
+			const who = Array.isArray(regress.persons) && regress.persons.length ? regress.persons : [regress.person];
+			sections.push(`회귀: ${who.join(", ")}은(는) 이전 시간선에서 돌아와 그때의 일을 모두 기억함. 다른 사람은 그 시간선을 기억하지 못함.`);
+		}
+		const status = [];
+		for (const p of people) {
+			const rows = list(p.records).filter((r) => usable(r) && r.attr && String(r.attr.c).toLowerCase() === "status");
+			if (!rows.length) continue;
+			const r = rows.reduce((a, b) => (b.at ?? -1) >= (a.at ?? -1) ? b : a);
+			const v = String(r.attr.v ?? "").slice(0, 40);
+			if (v) status.push({
+				name: p.name,
+				v,
+				at: r.at ?? -1,
+				gone: ABSENT.test(v) && !BACK.test(v)
+			});
+		}
+		section("인물 현재 상태 (오래된 기록보다 우선):", status.sort((a, b) => Number(b.gone) - Number(a.gone) || b.at - a.at).slice(0, 12).map((s) => `- ${s.name}: ${clean(s.v)}${s.gone ? " — 이야기에서 다시 데려오지 않는 한 지금은 등장하거나 말할 수 없음" : ""}`));
+		if (!plus) return sections.join("\n\n");
+		section("아직 이어지는 화제 (서둘러 해결하지 않음):", list(folder.open).filter((o) => !o?.orphan && !(o.closed && !o.closedOrphan) && valid(o)).slice(-6).map((o) => `- [${OPEN_KIND[o.kind] || o.kind}] ${clean(o.text)}${list(o.who).length ? ` (${o.who.join(", ")})` : ""}`));
+		section("감정 (0~10):", values(folder.emo).filter((e) => Object.keys(obj(e?.tags)).length && (member(e.from) || member(e.to))).sort((a, b) => latest(list(b.log).at(-1)) - latest(list(a.log).at(-1))).slice(0, 5).map((e) => `- ${e.from} → ${e.to}: ${Object.entries(cool ? cooled(e, now) : e.tags).filter(([, v]) => v != null).map(([k, v]) => `${EMO[k] || k} ${v}`).join(", ")}`));
+		if (human) {
+			const userKey = userNames.find((u) => list(folder.scenes).some((sc) => list(sc.who).some((w) => nameKey(w) === nameKey(u)))) || userNames[0];
+			const room = [...new Map([...roomPeople, userKey].filter(Boolean).map((n) => [nameKey(n), n])).values()], stages = [];
+			for (let a = 0; a < room.length && stages.length < 3; a++) for (let b = a + 1; b < room.length && stages.length < 3; b++) {
+				const s = stageOf(folder, room[a], room[b], now);
+				if (!s.shared && !s.warmth) continue;
+				stages.push(`- ${room[a]} ↔ ${room[b]}: ${STAGE[s.stage]} (함께한 장면 ${s.shared}개)${s.stage === "just met" || s.stage === "acquaintances" ? " — 가까워지는 건 천천히" : ""}`);
+			}
+			section("관계 단계 (친밀함은 천천히 바뀜):", stages);
+			section("서로 부르는 법 (바뀌지 않으면 그대로):", values(folder.talk).filter((t) => both(t?.from, t?.to) && valid(t)).sort((a, b) => latest(b) - latest(a)).slice(0, 4).map((t) => `- ${t.from} → ${t.to}: "${clean(t.call)}"(이)라고 부름, ${TONE[t.tone] || t.tone}${t.prev ? ` (전에는 "${clean(t.prev.call)}", ${TONE[t.prev.tone] || t.prev.tone})` : ""}`));
+			const byPair = new Map();
+			for (const b of list(folder.bonds).filter((b) => both(b?.a, b?.b) && valid(b))) {
+				const k = pairKey(b.a, b.b);
+				if (!byPair.has(k)) byPair.set(k, []);
+				byPair.get(k).push(b);
+			}
+			section("함께한 추억 (자연스러울 때만 꺼냄):", [...byPair.values()].slice(0, 2).map((g) => g[Math.floor(Math.max(0, now) / 10) % g.length]).map((b) => `- ${b.a} & ${b.b}: ${clean(b.moment)}${b.hook ? ` (떠올리는 계기: ${clean(b.hook)})` : ""}`));
+			const riftOn = (r) => !(r.state === "resolved" && (r.grudge ?? "none") === "none") && !(r.state === "resolved" && r.grudge === "some" && r.resolvedAt != null && now - r.resolvedAt > 200);
+			section("갈등 (사과나 화해로 바로 지워지지 않음):", list(folder.rifts).filter((r) => both(r?.a, r?.b) && valid(r) && riftOn(r)).slice(-3).map((r) => {
+				const who = r.who ? clean(r.who) : "";
+				const state = r.state === "resolved" ? `화해했지만 ${r.grudge === "deep" ? "깊은" : "조금"} 앙금이 남음${who ? ` (${who})` : ""}` : `${r.state === "apologized" ? "사과했지만 아직 용서받지 못함" : "풀리지 않음"}${who ? `; ${who}이(가) 아직 마음에 담아 둠` : ""}`;
+				return `- ${r.a} & ${r.b}: ${clean(r.about)} — ${state}`;
+			}));
+			section("곁에 누가 있느냐에 따른 태도:", values(folder.faces).filter((f) => both(f?.who, f?.to) && valid(f)).slice(-3).map((f) => `- ${f.who} → ${f.to}: 둘만 있을 때 ${clean(f.alone)}; 다른 사람이 있을 때 ${clean(f.public)}${set.size > 2 ? " (지금은 다른 사람도 함께 있음)" : ""}`));
+		}
+		if (inject.beliefs === true) section("잘못 믿고 있는 것 (사실을 알기 전까지 그대로 행동함):", list(folder.beliefs).filter((b) => b?.open && has(b.who) && valid(b)).slice(-3).map((b) => `- ${b.who}은(는) ${clean(b.thinks)}라고 믿음 (사실: ${clean(b.truth)}${b.by ? `; ${clean(b.by)}에게 속음` : ""})`));
+		if (inject.stage3 !== false) {
+			const pov = list(scene?.pov);
+			section("지금 일을 보는 시선 (인물마다 다르게 봄):", pov.length === 2 ? [`- ${pov.map((p) => `${p.who}: ${clean(p.view)}`).join(" / ")}${pov.find((p) => p.why) ? ` (다르게 보는 이유: ${clean(pov.find((p) => p.why).why)})` : ""}`] : []);
+			const inner = [];
+			for (const p of people) {
+				if (!has(p?.name)) continue;
+				const r = [...list(p.records)].reverse().find((x) => usable(x) && x.self);
+				if (r) inner.push({
+					at: r.at ?? -1,
+					line: `- ${p.name}: "${clean(r.self.feel)}"(을)를 느낌. 실제 이유(추정): ${clean(r.self.cause)}`
+				});
+			}
+			section("속마음 (실제 이유는 추정일 뿐):", inner.sort((a, b) => b.at - a.at).slice(0, 2).map((x) => x.line));
+			section("서로 기대하는 것의 차이:", values(folder.exp).filter((e) => e?.gap && (member(e.a) || member(e.b)) && valid(e)).sort((a, b) => latest(b) - latest(a)).slice(0, 2).map((e) => `- ${e.a}은(는) ${clean(e.ae)}(을)를 기대함(${e.as ? "말함" : "말하지 않음"}); ${e.b}은(는) ${clean(e.be)}(을)를 기대함(${e.bs ? "말함" : "말하지 않음"})${e.viol ? ` — ${clean(e.viol)}` : ""}`));
+		}
+		section("최근 관계 변화:", values(folder.rels).map((r) => ({
+			...r,
+			items: list(r.items).filter(valid)
+		})).filter((r) => r.items.length && (member(r.from) || member(r.to))).sort((a, b) => latest(b.items.at(-1)) - latest(a.items.at(-1))).slice(0, 5).map((r) => `- ${r.from} → ${r.to}: ${r.items.slice(-3).map((i) => `${clean(i.d)}${i.dir === "+" ? " ↑" : i.dir === "-" ? " ↓" : ""}`).join("; ")}`));
+		const known = [];
+		for (const p of people) for (const r of list(p.records)) if (usable(r) && list(r.know).length) known.push({
+			r,
+			who: p.name
+		});
+		section("누가 무엇을 아는지:", known.sort((a, b) => reach(b.r) - reach(a.r)).slice(0, 4).map(({ r, who }) => `- ${clean(r.act)} (${who}) — ${r.know.join(", ")}만 알고 다른 사람은 모름`));
+		return sections.join("\n\n");
+	}
+	async function duskRoomLines(ctx, members, pcName) {
+		const { index, folder } = await duskChat(ctx);
+		const names = members.flatMap((m) => [m.name, ...m.aliases || []]).filter(Boolean);
+		const lines = duskRelationLines(ctx, folder, names, obj(index?.settings), [pcName, "{{user}}"].filter(Boolean), members.map((m) => m.name).filter(Boolean));
+		return withUser(lines, pcName);
+	}
+
+//#endregion
+//#region src/compat/hypaplus.js
+	const stateKey = (ctx) => "hypaplus_state_" + ctx.char.chaId + "_" + ctx.chat.id;
+	async function readState(ctx) {
+		const data = await risuai.pluginStorage.getItem(stateKey(ctx));
+		return typeof data === "string" ? JSON.parse(data) : data;
+	}
+	const summaryText = (chunk) => typeof chunk.summarized === "string" && chunk.summarized.trim() && !/^[a-z_]+$/.test(chunk.summarized.trim());
+	async function hypaPlusEvents(ctx, recentIds) {
+		const data = await readState(ctx);
+		if (!Array.isArray(data?.chunks)) return [];
+		const present = new Set((ctx.chat.message || []).map((m) => m.chatId).filter(Boolean));
+		const events = [];
+		for (const chunk of data.chunks) {
+			const ids = Array.isArray(chunk.chatIds) ? chunk.chatIds : [];
+			if (!ids.some((id) => present.has(id)) || ids.every((id) => recentIds.has(id))) continue;
+			const nodes = Array.isArray(chunk.nodes) ? chunk.nodes : [];
+			for (const node of nodes) {
+				const body = String(node?.content || node?.text || "").trim();
+				if (!body) continue;
+				const when = [node.time, node.location].filter(Boolean).join(" · ");
+				const lines = (Array.isArray(node.dialogues) ? node.dialogues : []).filter((d) => typeof d?.speaker === "string" && typeof d?.text === "string" && d.text.trim()).map((d) => ({
+					speaker: d.speaker.trim(),
+					text: d.text.trim()
+				}));
+				events.push({
+					text: when ? `- ${when}: ${body}` : `- ${body}`,
+					who: Array.isArray(node.characters) ? node.characters.map(normalize) : [],
+					kind: node.type === "facts" ? "facts" : "event",
+					lines,
+					src: ids
+				});
+			}
+			if (!nodes.length && summaryText(chunk)) events.push({
+				text: "- " + chunk.summarized.trim(),
+				who: []
+			});
+		}
+		return events;
+	}
+	async function hypaPlusCoveredIds(ctx) {
+		let data = null;
+		try {
+			data = await readState(ctx);
+		} catch {
+			data = null;
+		}
+		const ids = new Set();
+		for (const chunk of Array.isArray(data?.chunks) ? data.chunks : []) {
+			if (!(Array.isArray(chunk.nodes) && chunk.nodes.length) && !summaryText(chunk)) continue;
+			for (const id of Array.isArray(chunk.chatIds) ? chunk.chatIds : []) ids.add(id);
+		}
+		return ids;
+	}
+	async function hypaPlusChunkIds(ctx) {
+		let data = null;
+		try {
+			data = await readState(ctx);
+		} catch {
+			data = null;
+		}
+		return new Map((Array.isArray(data?.chunks) ? data.chunks : []).map((c) => [String(c?.id ?? ""), Array.isArray(c?.chatIds) ? c.chatIds.filter((i) => typeof i === "string" && i) : []]));
+	}
+	async function hypaPlusPresent(ctx) {
+		try {
+			return Array.isArray((await readState(ctx))?.chunks);
+		} catch {
+			return false;
+		}
+	}
+
+//#endregion
+//#region src/compat/summary.js
+	const SUMMARY_PLUGINS = ["hypaplus", "dusk"];
+	function furthest(ctx, ids) {
+		const positions = new Map((ctx.chat.message || []).map((m, i) => [m.chatId, i]));
+		let at = -1;
+		for (const id of ids) {
+			const i = positions.get(id);
+			if (i !== undefined && i > at) at = i;
+		}
+		return at;
+	}
+	async function summaryPlugins(ctx, source = "auto") {
+		if (SUMMARY_PLUGINS.includes(source)) return [source];
+		let hypa = -1, hypaOn = false, dusk = -1, duskOn = false, duskUsable = true;
+		try {
+			hypaOn = await hypaPlusPresent(ctx);
+			if (hypaOn) hypa = furthest(ctx, await hypaPlusCoveredIds(ctx));
+		} catch {}
+		try {
+			const { index, folder } = await duskChat(ctx);
+			duskUsable = !index || duskMemoryOn(index, ctx.char.chaId);
+			if (folder && duskUsable) {
+				duskOn = true;
+				dusk = furthest(ctx, duskCoveredIds(folder, await hypaPlusChunkIds(ctx)));
+			}
+		} catch {}
+		if (!duskUsable) return ["hypaplus"];
+		return dusk > hypa || duskOn && !hypaOn ? ["dusk", "hypaplus"] : ["hypaplus", "dusk"];
+	}
+	async function summarizedIds(ctx, source = "auto") {
+		const [plugin] = await summaryPlugins(ctx, source);
+		if (plugin === "dusk") {
+			try {
+				return duskCoveredIds(await duskFolder(ctx), await hypaPlusChunkIds(ctx));
+			} catch {
+				return new Set();
+			}
+		}
+		return hypaPlusCoveredIds(ctx);
+	}
+	async function pluginEvents(kind, ctx, recentIds) {
+		try {
+			return kind === "dusk" ? await duskEvents(ctx, recentIds) : await hypaPlusEvents(ctx, recentIds);
+		} catch (e) {
+			const what = kind === "dusk" ? "Dusk memory failed" : "summary plugin failed";
+			console.log(`[interlude] ${what}: ` + e.message);
+			void systemFailure("load", e, what);
+			return [];
+		}
+	}
+	async function summaryEvents(ctx, recentIds, source = "auto") {
+		for (const kind of await summaryPlugins(ctx, source)) {
+			const events = await pluginEvents(kind, ctx, recentIds);
+			if (events.length) return {
+				kind,
+				events
+			};
+		}
+		return {
+			kind: "",
+			events: []
+		};
 	}
 
 //#endregion
@@ -684,58 +1248,10 @@
 			ids: win.ids
 		};
 	}
-	const summaryText = (chunk) => typeof chunk.summarized === "string" && chunk.summarized.trim() && !/^[a-z_]+$/.test(chunk.summarized.trim());
-	async function hypaPlusEvents(ctx, recentIds) {
-		let data = await risuai.pluginStorage.getItem("hypaplus_state_" + ctx.char.chaId + "_" + ctx.chat.id);
-		if (typeof data === "string") data = JSON.parse(data);
-		if (!Array.isArray(data?.chunks)) return [];
-		const present = new Set((ctx.chat.message || []).map((m) => m.chatId).filter(Boolean));
-		const events = [];
-		for (const chunk of data.chunks) {
-			const ids = Array.isArray(chunk.chatIds) ? chunk.chatIds : [];
-			if (!ids.some((id) => present.has(id)) || ids.every((id) => recentIds.has(id))) continue;
-			const nodes = Array.isArray(chunk.nodes) ? chunk.nodes : [];
-			for (const node of nodes) {
-				const body = String(node?.content || node?.text || "").trim();
-				if (!body) continue;
-				const when = [node.time, node.location].filter(Boolean).join(" · ");
-				const lines = (Array.isArray(node.dialogues) ? node.dialogues : []).filter((d) => typeof d?.speaker === "string" && typeof d?.text === "string" && d.text.trim()).map((d) => ({
-					speaker: d.speaker.trim(),
-					text: d.text.trim()
-				}));
-				events.push({
-					text: when ? `- ${when}: ${body}` : `- ${body}`,
-					who: Array.isArray(node.characters) ? node.characters.map(normalize) : [],
-					kind: node.type === "facts" ? "facts" : "event",
-					lines,
-					src: ids
-				});
-			}
-			if (!nodes.length && summaryText(chunk)) events.push({
-				text: "- " + chunk.summarized.trim(),
-				who: []
-			});
-		}
-		return events;
-	}
-	async function summarizedIds(ctx) {
-		let data = null;
-		try {
-			data = await risuai.pluginStorage.getItem("hypaplus_state_" + ctx.char.chaId + "_" + ctx.chat.id);
-			if (typeof data === "string") data = JSON.parse(data);
-		} catch {
-			data = null;
-		}
-		const ids = new Set();
-		for (const chunk of Array.isArray(data?.chunks) ? data.chunks : []) {
-			if (!(Array.isArray(chunk.nodes) && chunk.nodes.length) && !summaryText(chunk)) continue;
-			for (const id of Array.isArray(chunk.chatIds) ? chunk.chatIds : []) ids.add(id);
-		}
-		return ids;
-	}
 	const STORY_SOURCES = [
 		["auto", "자동"],
 		["hypaplus", "요약 플러그인 (HypaPlus)"],
+		["dusk", "요약 플러그인 (Dusk Atelier)"],
 		["hypav3", "Risu 장기기억"],
 		["hypav2", "Risu 장기기억 (이전 V2)"],
 		["supa", "Risu 장기기억 (이전 SupaMemory)"]
@@ -766,13 +1282,7 @@
 		return [];
 	}
 	async function legacySummary(ctx, members, recentIds) {
-		let events = [];
-		try {
-			events = await hypaPlusEvents(ctx, recentIds);
-		} catch (e) {
-			console.log("[interlude] summary plugin failed: " + e.message);
-			void systemFailure("load", e, "summary plugin failed");
-		}
+		let { events } = await summaryEvents(ctx, recentIds);
 		if (!events.length) events = (ctx.chat.hypaV3Data?.summaries || []).map((s) => ({
 			text: "- " + String(s.text || "").trim(),
 			who: []
@@ -793,22 +1303,14 @@
 	}
 	async function storyMemory(ctx, members, recentIds, limit, source = "auto", options = {}) {
 		const order = source === "auto" ? [
-			"hypaplus",
+			...await summaryPlugins(ctx, "auto"),
 			"hypav3",
 			"hypav2",
 			"supa"
 		] : [source];
 		let events = [], used = "";
 		for (const kind of order) {
-			if (kind === "hypaplus") {
-				try {
-					events = await hypaPlusEvents(ctx, recentIds);
-				} catch (e) {
-					events = [];
-					console.log("[interlude] summary plugin failed: " + e.message);
-					void systemFailure("load", e, "summary plugin failed");
-				}
-			} else events = risuSummaries(ctx.chat, kind, recentIds);
+			events = SUMMARY_PLUGINS.includes(kind) ? await pluginEvents(kind, ctx, recentIds) : risuSummaries(ctx.chat, kind, recentIds);
 			if (events.length) {
 				used = kind;
 				break;
@@ -2431,7 +2933,7 @@ feeling은 그 상대에 대한 감정, promises는 현재 유효한 약속 목�
 		return out;
 	}
 	async function storyPlan(ctx, state, limit, { includeHistory = false } = {}) {
-		const covered = await summarizedIds(ctx);
+		const covered = await summarizedIds(ctx, state.storySource || "auto");
 		const all = (ctx.chat.message || []).filter((m) => m.chatId).map((m) => ({
 			id: m.chatId,
 			text: messageText(m)
@@ -5716,7 +6218,7 @@ ${labeled}`;
 			});
 		}
 		const resolve = makeResolver(people), memberIds = new Set(members.map((m) => m.id));
-		for (const event of state.storyIn !== false ? await hypaPlusEvents(ctx, new Set()) : []) {
+		for (const event of state.storyIn !== false ? (await summaryEvents(ctx, new Set(), state.storySource || "auto")).events : []) {
 			const owned = event.who.some((name) => memberIds.has(resolve(name, event.who, () => event.text)));
 			if (!owned && !relevant(event.text)) continue;
 			const sourceIds = (event.src || []).filter((id) => positions.has(id));
@@ -14754,6 +15256,28 @@ ${labeledLog}`;
 				truncated: remembered.used < remembered.total
 			});
 		}
+		let duskLines = "";
+		if (remembered?.source === "dusk") {
+			try {
+				duskLines = await duskRoomLines(ctx, members, pcName);
+			} catch (e) {
+				report.push({
+					section: "duskRelations",
+					sourceChars: 0,
+					usedChars: 0,
+					limit: 0,
+					truncated: false,
+					error: e.message
+				});
+			}
+			if (duskLines) report.push({
+				section: "duskRelations",
+				sourceChars: duskLines.length,
+				usedChars: duskLines.length,
+				limit: 0,
+				truncated: false
+			});
+		}
 		const log = roomLog(state, room, pcName, budget.roomHistory, report, timeNow);
 		const nameOf = (id) => state.contacts.find((c) => c.id === id)?.name || "알 수 없음";
 		const memo = useMemory || storyRead ? memoryBlocks(members, room.msgs.slice(-6).map((m) => m.text).join("\n"), report, nameOf, {
@@ -14845,7 +15369,7 @@ ${actorLore || "(없음)"}${actorFacts ? `\n설정 메모리:\n${actorFacts}` : 
 [봇 설명]
 ${description}
 
-${summary ? `${useMemory ? "[본편 메모리 - 앞선 줄거리 요약]" : "[앞선 줄거리 요약]"}\n${summary}\n\n` : ""}${storyView ? `[최근 줄거리 - 인물마다 그 인물이 직접 보고 들은 것만]\n${storyView}\n\n` : storyIn ? `[최근 줄거리]\n${story}\n\n` : ""}[참가자 설정]
+${summary ? `${useMemory ? "[본편 메모리 - 앞선 줄거리 요약]" : "[앞선 줄거리 요약]"}\n${summary}\n\n` : ""}${duskLines ? `[본편 메모리 - 인물 관계 기록]\n${duskLines}\n\n` : ""}${storyView ? `[최근 줄거리 - 인물마다 그 인물이 직접 보고 들은 것만]\n${storyView}\n\n` : storyIn ? `[최근 줄거리]\n${story}\n\n` : ""}[참가자 설정]
 ${members.filter((m) => m.bio).map((m) => `${m.name}의 한줄 소개: ${spell(m.bio)}`).join("\n")}
 ${userPlays ? `## ${pcName}${state.meBio ? `\n한줄 소개: ${state.meBio}` : ""}\n${persona || "(없음)"}\n\n` : ""}${lore || "(없음)"}
 ${memo.facts ? `\n[설정 메모리 - 사용자가 확정한 사실. 다른 메모리와 줄거리보다 우선]\n${memo.facts}\n` : ""}${voice ? `\n[말투 기준 - 이 RP에서 실제로 쓴 말. 말투 참고용]\n${voice}\n` : ""}
