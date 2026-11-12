@@ -1,7 +1,7 @@
 //@name interlude
-//@display-name Interlude v1.4.1
+//@display-name Interlude v1.4.2
 //@api 3.0
-//@version 1.4.1
+//@version 1.4.2
 //@update-url https://raw.githubusercontent.com/Nicered/interlude-risu/main/interlude.js
 //@arg model_slot string 쓸 모델. aux는 Risu 보조 모델, main은 Risu 메인 모델입니다.
 //@arg nai_key string NovelAI API 키 (사진 기능). Interlude 설정 → 시작 준비에서 입력합니다.
@@ -188,7 +188,7 @@
 
 //#endregion
 //#region src/core/constants.js
-	const PLUGIN_VERSION = "1.4.1";
+	const PLUGIN_VERSION = "1.4.2";
 	const STORE_PREFIX = "interlude:v1:";
 	const STORY_CHARS = 16e3;
 	const SUMMARY_CHARS = 6e3;
@@ -236,6 +236,26 @@
 	const SYSTEM_KEY = "interlude:system-log:v1";
 	const SYSTEM_MAX = 200;
 	const SYSTEM_BUDGET = 2e6;
+	const PAGE_PREFIX = "interlude:system-log:v2:p:";
+	const INDEX_KEY = "interlude:system-log:v2:index";
+	const PAGE_ROWS = 20;
+	const pageOf = new Map();
+	const dirtyPages = new Set();
+	const knownPages = new Set();
+	let pageSeq = 0;
+	let legacyPending = false;
+	const parseLog = (raw) => typeof raw === "string" ? JSON.parse(raw) : raw;
+	const placeNew = (id) => {
+		pageOf.set(id, Math.floor(pageSeq / PAGE_ROWS));
+		pageSeq++;
+		dirtyPages.add(pageOf.get(id));
+	};
+	const dropRow = (row) => {
+		if (pageOf.has(row.id)) {
+			dirtyPages.add(pageOf.get(row.id));
+			pageOf.delete(row.id);
+		}
+	};
 	const SYSTEM_KINDS = {
 		model: "모델 요청",
 		"reply-model": "답장 모델 요청",
@@ -353,14 +373,43 @@
 		if (systemRows) return systemRows;
 		if (!systemLoading) systemLoading = (async () => {
 			try {
-				const read = await systemWait(risuai.pluginStorage.getItem(SYSTEM_KEY));
+				const read = await systemWait(risuai.pluginStorage.getItem(INDEX_KEY));
 				if (!read.ok) throw new Error("Log storage unavailable");
-				const raw = read.value;
-				const value = typeof raw === "string" ? JSON.parse(raw) : raw;
-				systemRows = (Array.isArray(value) ? value : []).filter((e) => e && typeof e === "object").slice(0, SYSTEM_MAX).map((e) => systemRecord({
-					...e,
-					status: e.status === "running" ? "interrupted" : e.status
-				}));
+				const index = parseLog(read.value);
+				const rows = [];
+				if (index?.schema === 2 && Array.isArray(index.pages)) {
+					const pages = await Promise.all(index.pages.map((p) => systemWait(risuai.pluginStorage.getItem(PAGE_PREFIX + p))));
+					if (pages.some((r) => !r.ok)) throw new Error("Log storage unavailable");
+					pages.forEach((r, i) => {
+						const p = index.pages[i];
+						knownPages.add(p);
+						for (const e of Array.isArray(parseLog(r.value)) ? parseLog(r.value) : []) {
+							if (!e || typeof e !== "object") continue;
+							const row = systemRecord({
+								...e,
+								status: e.status === "running" ? "interrupted" : e.status
+							});
+							rows.push(row);
+							pageOf.set(row.id, p);
+						}
+					});
+					pageSeq = Number(index.seq) || 0;
+				} else {
+					const old = await systemWait(risuai.pluginStorage.getItem(SYSTEM_KEY));
+					if (!old.ok) throw new Error("Log storage unavailable");
+					const list = parseLog(old.value);
+					legacyPending = old.value !== undefined && old.value !== null;
+					const legacy = (Array.isArray(list) ? list : []).filter((e) => e && typeof e === "object").slice(0, SYSTEM_MAX).map((e) => systemRecord({
+						...e,
+						status: e.status === "running" ? "interrupted" : e.status
+					}));
+					for (const row of [...legacy].reverse()) placeNew(row.id);
+					rows.push(...legacy);
+				}
+				rows.sort((x, y) => y.t - x.t);
+				for (const row of rows.slice(SYSTEM_MAX)) dropRow(row);
+				systemRows = rows.slice(0, SYSTEM_MAX);
+				if (legacyPending) systemScheduleFlush();
 			} catch {
 				systemRows = [];
 				systemStorageError = true;
@@ -375,9 +424,16 @@
 		await systemLoad();
 		if (epoch !== systemEpoch) return;
 		const index = systemRows.findIndex((row) => row.id === record.id);
-		if (index >= 0) systemRows[index] = record;
-		else systemRows.unshift(record);
+		if (index >= 0) {
+			systemRows[index] = record;
+			if (pageOf.has(record.id)) dirtyPages.add(pageOf.get(record.id));
+			else placeNew(record.id);
+		} else {
+			systemRows.unshift(record);
+			placeNew(record.id);
+		}
 		systemRows.sort((a, b) => b.t - a.t);
+		for (const row of systemRows.slice(SYSTEM_MAX)) dropRow(row);
 		systemRows.length = Math.min(systemRows.length, SYSTEM_MAX);
 		systemScheduleFlush();
 	}
@@ -392,13 +448,38 @@
 		const epoch = systemEpoch;
 		systemQueue = systemQueue.then(async () => {
 			if (epoch !== systemEpoch || !systemRows) return;
-			const parts = systemRows.map((row) => JSON.stringify(row));
-			let count = parts.length;
-			let length = 2 + parts.reduce((sum, part) => sum + part.length, 0) + Math.max(0, count - 1);
-			while (length > SYSTEM_BUDGET && count > 1) length -= parts[--count].length + 1;
+			for (const row of [...systemRows].reverse()) if (!pageOf.has(row.id)) placeNew(row.id);
+			const sizes = systemRows.map((row) => JSON.stringify(row).length);
+			let count = sizes.length, length = 2 + sizes.reduce((sum, n) => sum + n, 0) + Math.max(0, count - 1);
+			while (length > SYSTEM_BUDGET && count > 1) length -= sizes[--count] + 1;
+			for (const row of systemRows.slice(count)) dropRow(row);
 			systemRows.length = count;
-			const data = "[" + parts.slice(0, count).join(",") + "]";
-			await risuai.pluginStorage.setItem(SYSTEM_KEY, data);
+			const pages = [...dirtyPages];
+			dirtyPages.clear();
+			try {
+				for (const p of pages) {
+					const rows = systemRows.filter((row) => pageOf.get(row.id) === p);
+					if (rows.length) {
+						await risuai.pluginStorage.setItem(PAGE_PREFIX + p, "[" + rows.map((row) => JSON.stringify(row)).join(",") + "]");
+						knownPages.add(p);
+					} else if (knownPages.has(p)) {
+						await risuai.pluginStorage.removeItem(PAGE_PREFIX + p);
+						knownPages.delete(p);
+					}
+				}
+				await risuai.pluginStorage.setItem(INDEX_KEY, JSON.stringify({
+					schema: 2,
+					seq: pageSeq,
+					pages: [...knownPages].sort((x, y) => y - x)
+				}));
+				if (legacyPending) {
+					await risuai.pluginStorage.removeItem(SYSTEM_KEY);
+					legacyPending = false;
+				}
+			} catch (e) {
+				for (const p of pages) dirtyPages.add(p);
+				throw e;
+			}
 			systemStorageError = false;
 		}).catch(() => {
 			systemStorageError = true;
@@ -433,7 +514,15 @@
 		systemEpoch++;
 		await systemLoad();
 		systemRows = [];
+		const pages = [...knownPages];
+		pageOf.clear();
+		dirtyPages.clear();
+		knownPages.clear();
+		pageSeq = 0;
+		legacyPending = false;
 		systemQueue = systemQueue.then(async () => {
+			for (const p of pages) await risuai.pluginStorage.removeItem(PAGE_PREFIX + p);
+			await risuai.pluginStorage.removeItem(INDEX_KEY);
 			await risuai.pluginStorage.removeItem(SYSTEM_KEY);
 			systemStorageError = false;
 		}).catch(() => {
@@ -1707,6 +1796,125 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		};
 	}
 	let botSelf = null;
+	const IMAGE_PREFIX = "interlude:img:v1:";
+	const IMAGE_REF = "interlude-img:";
+	const IMAGE_FIELDS = new Set(["image", "source"]);
+	const storedImages = new Set();
+	const imageCache = new Map();
+	function imageHash(text) {
+		let h1 = 3735928559, h2 = 1103547991;
+		for (let i = 0; i < text.length; i++) {
+			const c = text.charCodeAt(i);
+			h1 = Math.imul(h1 ^ c, 2654435761);
+			h2 = Math.imul(h2 ^ c, 1597334677);
+		}
+		h1 = Math.imul(h1 ^ h1 >>> 16, 2246822507) ^ Math.imul(h2 ^ h2 >>> 13, 3266489909);
+		h2 = Math.imul(h2 ^ h2 >>> 16, 2246822507) ^ Math.imul(h1 ^ h1 >>> 13, 3266489909);
+		return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36) + "-" + text.length.toString(36);
+	}
+	const isPicture = (k, v) => IMAGE_FIELDS.has(k) && typeof v === "string" && v.length > 1024 && v.startsWith("data:image/");
+	const TEXT_PREFIX = "interlude:txt:v1:";
+	const TEXT_REF = "interlude-txt:";
+	const LONG_TEXT = 1024;
+	const storedTexts = new Set();
+	const textCache = new Map();
+	const longText = (v) => typeof v === "string" && v.length > LONG_TEXT;
+	async function packState(state) {
+		const found = new Map(), texts = new Map();
+		const textRef = (v) => {
+			const id = imageHash(v);
+			texts.set(id, v);
+			return TEXT_REF + id;
+		};
+		const text = JSON.stringify(state, (k, v) => {
+			if (k === "analysisLore" && longText(v)) return textRef(v);
+			if (k === "relationshipHistory" && Array.isArray(v)) return v.map((r) => Array.isArray(r?.source?.evidence) ? {
+				...r,
+				source: {
+					...r.source,
+					evidence: r.source.evidence.map((e) => e && longText(e.text) ? {
+						...e,
+						text: textRef(e.text)
+					} : e)
+				}
+			} : r);
+			if (!isPicture(k, v)) return v;
+			const id = imageHash(v);
+			found.set(id, v);
+			return IMAGE_REF + id;
+		});
+		for (const [id, data] of texts) {
+			if (storedTexts.has(id)) continue;
+			await risuai.pluginStorage.setItem(TEXT_PREFIX + id, data);
+			storedTexts.add(id);
+			textCache.set(id, data);
+		}
+		for (const [id, data] of found) {
+			if (storedImages.has(id)) continue;
+			await risuai.pluginStorage.setItem(IMAGE_PREFIX + id, data);
+			storedImages.add(id);
+			imageCache.set(id, data);
+		}
+		return text;
+	}
+	async function unpackState(state) {
+		const refs = [], textRefs = [];
+		const walk = (obj, evidence = false) => {
+			if (!obj || typeof obj !== "object") return;
+			for (const [k, v] of Object.entries(obj)) {
+				if (IMAGE_FIELDS.has(k) && typeof v === "string" && v.startsWith(IMAGE_REF)) refs.push([
+					obj,
+					k,
+					v.slice(IMAGE_REF.length)
+				]);
+				else if ((k === "analysisLore" || evidence && k === "text") && typeof v === "string" && v.startsWith(TEXT_REF)) textRefs.push([
+					obj,
+					k,
+					v.slice(TEXT_REF.length)
+				]);
+				else if (v && typeof v === "object") walk(v, evidence || k === "evidence");
+			}
+		};
+		walk(state);
+		const textIds = [...new Set(textRefs.map((r) => r[2]).filter((id) => !textCache.has(id)))];
+		await Promise.all(textIds.map(async (id) => {
+			let data = null;
+			try {
+				data = await risuai.pluginStorage.getItem(TEXT_PREFIX + id);
+			} catch {
+				data = null;
+			}
+			if (typeof data === "string") {
+				textCache.set(id, data);
+				storedTexts.add(id);
+			}
+		}));
+		for (const [obj, k, id] of textRefs) obj[k] = textCache.get(id) ?? "";
+		const ids = [...new Set(refs.map((r) => r[2]).filter((id) => !imageCache.has(id)))];
+		await Promise.all(ids.map(async (id) => {
+			let data = null;
+			try {
+				data = await risuai.pluginStorage.getItem(IMAGE_PREFIX + id);
+			} catch {
+				data = null;
+			}
+			if (typeof data === "string" && data.startsWith("data:image/")) {
+				imageCache.set(id, data);
+				storedImages.add(id);
+			}
+		}));
+		for (const [obj, k, id] of refs) obj[k] = imageCache.get(id) || "";
+		return state;
+	}
+	async function readChatState(key) {
+		try {
+			const raw = await risuai.pluginStorage.getItem(key);
+			const state = typeof raw === "string" ? JSON.parse(raw) : raw;
+			return state && typeof state === "object" ? await unpackState(state) : null;
+		} catch {
+			return null;
+		}
+	}
 	async function loadState(key) {
 		if (states.has(key)) return states.get(key);
 		const event = await systemStart("load");
@@ -1714,6 +1922,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 		try {
 			const raw = await risuai.pluginStorage.getItem(key);
 			state = typeof raw === "string" ? JSON.parse(raw) : raw;
+			if (state) await unpackState(state);
 			await systemEnd(event);
 		} catch (e) {
 			await systemEnd(event, "failed", e);
@@ -1749,7 +1958,7 @@ ${assetPrefixes(assets).join(", ").slice(0, 8e3)}`
 	}
 	async function saveStateRaw(key) {
 		const state = states.get(key);
-		if (state) await risuai.pluginStorage.setItem(key, JSON.stringify(state));
+		if (state) await risuai.pluginStorage.setItem(key, await packState(state));
 	}
 	const saveState = systemInstrument("storage", saveStateRaw);
 
@@ -2232,6 +2441,7 @@ feeling은 그 상대에 대한 감정, promises는 현재 유효한 약속 목�
 		});
 		const tail = all.filter((m) => !covered.has(m.id));
 		const at = new Map(all.map((m, i) => [m.id, i]));
+		const tailById = new Map(tail.map((m) => [m.id, m]));
 		let cur = state.storyCursor && typeof state.storyCursor === "object" ? state.storyCursor : null;
 		let changed = false;
 		if (cur) {
@@ -2242,7 +2452,7 @@ feeling은 그 상대에 대한 감정, promises는 현재 유효한 약속 목�
 					changed = true;
 					continue;
 				}
-				const m = tail.find((x) => x.id === id);
+				const m = tailById.get(id);
 				if (!m || hashOf(m.text) !== h) {
 					gone.push(id);
 					delete cur.done[id];
@@ -2309,7 +2519,7 @@ feeling은 그 상대에 대한 감정, promises는 현재 유효한 약속 목�
 	const jobs = new Map();
 	const storyReads = new Map();
 	function readStory(key, state, batch, members, pcName, { validate, prepare } = {}) {
-		const jobKey = key + "|" + batch.map((m) => m.id).join(",");
+		const jobKey = key + "|" + batch.map((m) => m.id + ":" + hashOf(m.full || m.text)).join(",");
 		if (!jobs.has(jobKey)) {
 			const job = {
 				validators: new Set(),
@@ -2384,6 +2594,8 @@ ${labeled}`;
 			}], null, "story-memory"));
 			if (validate && !await validate()) throw new Error("정리 중 본편이 바뀌었어요. 미처리분을 다시 확인해 주세요.");
 			if (!raw) throw new Error("본편 기억 응답을 해석하지 못했습니다");
+			const replaced = new Set(batch.filter((m) => cur.done[m.id] && cur.done[m.id] !== hashOf(m.full || m.text)).map((m) => m.id));
+			if (replaced.size) for (const c of state.contacts || []) c.memory = (c.memory || []).filter((x) => !(x.type === "story" && (x.src || []).some((id) => replaced.has(id))));
 			const resolve = makeResolver(people);
 			const src = batch.map((m) => m.id);
 			const now = Date.now();
@@ -2497,7 +2709,6 @@ ${labeled}`;
 				for (const batch of selected) {
 					if (job.stopping) break;
 					const validate = () => storyBatchUnchanged(plan.ctx, batch);
-					if (!await validate()) throw new Error("본편이 바뀌었어요. 미처리분을 다시 확인해 주세요.");
 					const prepare = async (queued) => {
 						const waiting = await storyPlan(plan.ctx, plan.state, MODES[modeOf(plan.state)].story, { includeHistory: true });
 						const ids = new Set(waiting.batches.flatMap((b) => b.map((m) => m.id)));
@@ -5414,7 +5625,10 @@ ${labeled}`;
 			}
 			const old = existing ? { ...existing } : null;
 			if (existing) {
+				const linksBefore = findLoreEntries(existing, books).map(loreEntryRef).sort().join("\n");
 				Object.assign(existing, draft);
+				for (const field of ["loreSelection", "loreSeen"]) if (!(field in draft)) delete existing[field];
+				if (existing.card && linksBefore !== findLoreEntries(existing, books).map(loreEntryRef).sort().join("\n")) existing.analysisStale = true;
 			} else {
 				state.removedNames = (state.removedNames || []).filter((n) => n !== normalize(value));
 				if (!draft.image) draft.image = pickAsset(draft, assets);
@@ -10949,8 +11163,8 @@ ${lore.slice(0, 1200)}`;
 		const validLocal = (c) => c?.cardSchema === 2 && (c.analysisLore === lore || !c.analysisLore && c.loreHash === loreHash(lore)) && verifiedSharedCard(c.card, lore);
 		let card = validLocal(contact);
 		if (!card) for (const chatKey of (options.chatKeys || []).filter((k) => !options.knownKeys || options.knownKeys.has(k))) {
-			if (options.chatStates && !options.chatStates.has(chatKey)) options.chatStates.set(chatKey, readJson(chatKey));
-			const other = options.chatStates ? await options.chatStates.get(chatKey) : await readJson(chatKey);
+			if (options.chatStates && !options.chatStates.has(chatKey)) options.chatStates.set(chatKey, readChatState(chatKey));
+			const other = options.chatStates ? await options.chatStates.get(chatKey) : await readChatState(chatKey);
 			const match = (Array.isArray(other?.contacts) ? other.contacts : []).find((c) => personKey(c) === personKey(contact) && validLocal(c));
 			if (match) {
 				card = validLocal(match);
