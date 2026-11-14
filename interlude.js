@@ -1,7 +1,7 @@
 //@name interlude
-//@display-name Interlude v1.4.3
+//@display-name Interlude v1.4.4
 //@api 3.0
-//@version 1.4.3
+//@version 1.4.4
 //@update-url https://raw.githubusercontent.com/Nicered/interlude-risu/main/interlude.js
 //@arg model_slot string 쓸 모델. aux는 Risu 보조 모델, main은 Risu 메인 모델입니다.
 //@arg nai_key string NovelAI API 키 (사진 기능). Interlude 설정 → 시작 준비에서 입력합니다.
@@ -188,7 +188,7 @@
 
 //#endregion
 //#region src/core/constants.js
-	const PLUGIN_VERSION = "1.4.3";
+	const PLUGIN_VERSION = "1.4.4";
 	const STORE_PREFIX = "interlude:v1:";
 	const STORY_CHARS = 16e3;
 	const SUMMARY_CHARS = 6e3;
@@ -5276,9 +5276,9 @@ ${labeled}`;
 		let found = 0;
 		for (const contact of contacts) {
 			if (job.stop) break;
-			await checkImageTags(contact.imageTags, personNames(contact, books));
-			if (contact.imageTags.check.state === "registered") found++;
 			const lore = await memberLoreText(contact, books, contextBudget(state).analysis);
+			await checkImageTags(contact.imageTags, [...personNames(contact, books), ...loreNames(lore)], ctx?.char?.name || "");
+			if (contact.imageTags.check.state === "registered") found++;
 			await storeImageTags(ctx.char.chaId, contact, lore, contact.imageTags);
 			job.done++;
 			await saveState(key);
@@ -6997,7 +6997,11 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 		if (!imageCfg.enabled && !c.imageTags && !sent.length) return null;
 		const t = c.imageTags;
 		const st = t?.check?.state;
-		const status = !t ? "아직 사진 태그가 없어요. 처음 사진을 보낼 때 만들거나 아래에서 바로 만들 수 있어요." : st === "registered" ? `✓ NovelAI ${modelLabel(t.check.model)}에 등록된 캐릭터예요 · ${trainedLabel(t.check.count)}` : st === "error" ? `NovelAI에서 확인하지 못했어요. ${t.check.error || ""}` : `✗ NovelAI ${modelLabel(t.check?.model || imageCfg.model)}가 모르는 인물이에요. 외형 태그로 그립니다.`;
+		const status = !t ? "아직 사진 태그가 없어요. 처음 사진을 보낼 때 만들거나 아래에서 바로 만들 수 있어요." : st === "registered" ? `✓ NovelAI ${modelLabel(t.check.model)}에 등록된 캐릭터예요 · ${trainedLabel(t.check.count)} · ${{
+			on: "외형 태그도 그대로 넣어요",
+			off: "외형 태그 없이 캐릭터 태그로 그려요",
+			weak: "외형 태그는 약하게 넣어요"
+		}[looksModeOf(t)]}` : st === "error" ? `NovelAI에서 확인하지 못했어요. ${t.check.error || ""}` : `✗ NovelAI ${modelLabel(t.check?.model || imageCfg.model)}가 모르는 인물이에요. 외형 태그로 그립니다.`;
 		const key = view.key, ctx = view.ctx;
 		const charInput = h("input", {
 			type: "text",
@@ -7041,6 +7045,30 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 			value: v,
 			selected: (t?.gender || "girl") === v
 		}, label)));
+		const looksMode = h("select", {
+			"aria-label": "캐릭터 태그가 있을 때 외형 태그",
+			"data-t": "tag-looks-mode",
+			disabled: !t,
+			onchange: async (e) => {
+				if (!c.imageTags) return;
+				if (e.target.value === "on" || e.target.value === "off") c.imageTags.looksMode = e.target.value;
+				else delete c.imageTags.looksMode;
+				await saveState(key);
+				try {
+					await storeImageTags(ctx.char.chaId, c, await memberLoreText(c, await loreBooks(), contextBudget(state).analysis), c.imageTags);
+				} catch (err) {
+					c.imageTagError = err.message;
+				}
+				if (view.key === key) render();
+			}
+		}, [
+			["", "약하게 (기본)"],
+			["on", "그대로 넣기"],
+			["off", "빼기"]
+		].map(([v, label]) => h("option", {
+			value: v,
+			selected: (looksModeOf(t) === "weak" ? "" : looksModeOf(t)) === v
+		}, label)));
 		const busy = view.tagBusy === c.id;
 		const saveManual = async () => {
 			if (view.tagBusy) return;
@@ -7056,9 +7084,12 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 					looks: cleanTags(looksInput.value, 600),
 					outfit: cleanTags(outfitInput.value, 400),
 					background: cleanTags(backgroundInput.value, 300),
-					manual: true
+					manual: true,
+					userCharacter: tagForm(charInput.value),
+					userCopyright: tagForm(copyInput.value),
+					...looksModeOf(t) !== "weak" ? { looksMode: looksModeOf(t) } : {}
 				};
-				await checkImageTags(tags);
+				await checkImageTags(tags, [], ctx?.char?.name || "");
 				const lore = await memberLoreText(c, await loreBooks(), contextBudget(state).analysis);
 				tags.loreHash = loreHash(lore);
 				c.imageTags = tags;
@@ -7140,7 +7171,10 @@ ${plan.rows.map((r) => `${r.label}\n${r.text}`).join("\n\n")}`;
 		}, status), c.imageTagError ? h("div", {
 			class: "notice flush",
 			role: "alert"
-		}, c.imageTagError) : null, imageCfg.enabled ? h("details", { "data-t": "tag-details" }, h("summary", { class: "analysis-summary" }, "사진 태그 고치기"), h("label", { class: "field flat" }, h("span", { class: "label" }, "캐릭터 태그 (NovelAI에서 확인)"), charInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "작품 태그"), copyInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "외형 태그"), looksInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "기본 의상 태그 (옷 요청이 없을 때 입는 옷)"), outfitInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "프로필 배경 태그 (배경 포함일 때 프로필 그리기에서만 사용)"), backgroundInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "성별"), gender), h("div", { class: "actions" }, h("button", {
+		}, c.imageTagError) : null, imageCfg.enabled ? h("details", { "data-t": "tag-details" }, h("summary", { class: "analysis-summary" }, "사진 태그 고치기"), h("label", { class: "field flat" }, h("span", { class: "label" }, "캐릭터 태그 (NovelAI에서 확인)"), charInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "작품 태그"), copyInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "외형 태그"), looksInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "캐릭터 태그가 등록됐을 때 외형 태그"), looksMode), h("div", {
+			class: "sub",
+			"data-t": "tag-looks-mode-hint"
+		}, "NovelAI가 아는 캐릭터에 외형 태그를 그대로 겹치면 특징이 과하게 나올 수 있어서 기본은 약하게 넣어요. 그래도 과하면 \"빼기\", 특징이 빠지면 \"그대로 넣기\"를 고르세요. 눈 색처럼 꼭 맞출 특징은 외형 태그에 남기고 \"그대로 넣기\"를 써도 돼요."), h("label", { class: "field flat" }, h("span", { class: "label" }, "기본 의상 태그 (옷 요청이 없을 때 입는 옷)"), outfitInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "프로필 배경 태그 (배경 포함일 때 프로필 그리기에서만 사용)"), backgroundInput), h("label", { class: "field flat" }, h("span", { class: "label" }, "성별"), gender), h("div", { class: "actions" }, h("button", {
 			class: "pill primary",
 			"data-t": "tag-save",
 			disabled: busy || !naiKey,
@@ -12180,14 +12214,27 @@ ${lore}`;
 			coveringAdded
 		};
 	}
-	const TAG_CHECK_VERSION = 2;
+	const TAG_CHECK_VERSION = 3;
+	function loreNames(lore) {
+		const out = [];
+		for (const m of String(lore || "").matchAll(/^[\s*#>-]*(?:full\s+)?name\s*[:：]\s*([^\n]+)/gim)) {
+			for (const part of m[1].replace(/\([^)]*\)/g, " / ").split(/[\/,;|]/)) {
+				const name = part.replace(/[*_`"]/g, "").trim();
+				if (/^[A-Za-z][A-Za-z' .-]{1,40}$/.test(name)) out.push(name);
+			}
+		}
+		return [...new Set(out)];
+	}
 	function seriesForms(tags, names) {
 		if (!tags.copyright) return [];
 		const latin = (s) => tagForm(s).replace(/\s*\(.*\)\s*$/, "");
 		const forms = [];
+		const own = new Set((names || []).flatMap((n) => latin(n).split(/[\s-]+/)).filter(Boolean));
+		const typed = tagForm(tags.userCharacter ?? (tags.manual ? tags.candidates?.[0] : ""));
 		for (const c of tags.candidates || []) {
+			if (typed && tagForm(c) === typed) continue;
 			const words = latin(c).split(" ").filter(Boolean);
-			if (!String(c).includes("(") && words.length >= 2) forms.push(words[words.length - 1]);
+			if (!String(c).includes("(") && words.length >= 2 && own.has(words[words.length - 1])) forms.push(words[words.length - 1]);
 		}
 		for (const n of names || []) {
 			const word = latin(n);
@@ -12195,7 +12242,10 @@ ${lore}`;
 		}
 		return forms.map((w) => `${w} (${tags.copyright})`);
 	}
-	async function checkImageTags(tags, names = []) {
+	function plainForms(names) {
+		return (names || []).map((n) => tagForm(n).replace(/\s*\(.*\)\s*$/, "")).filter((w) => /^[a-z][a-z' -]{1,30}$/.test(w) && w.includes(" "));
+	}
+	async function checkImageTags(tags, names = [], botName = "") {
 		tags.check = {
 			state: "unregistered",
 			count: 0,
@@ -12207,11 +12257,18 @@ ${lore}`;
 		tags.copyrightGuess ??= tags.copyright || "";
 		try {
 			tags.copyright = "";
-			if (tags.copyrightGuess) {
-				const hit = matchTag(tags.copyrightGuess, await naiSuggest(tags.copyrightGuess));
-				if (hit) tags.copyright = tagForm(hit.tag);
+			for (const guess of [...new Set([tags.copyrightGuess, botName].map(tagForm).filter(Boolean))]) {
+				const hit = matchTag(guess, await naiSuggest(guess));
+				if (hit) {
+					tags.copyright = tagForm(hit.tag);
+					break;
+				}
 			}
-			const tries = [...new Set([...(tags.candidates || []).slice(0, 4), ...seriesForms(tags, names)].map(tagForm).filter(Boolean))].slice(0, 10);
+			const tries = [...new Set([
+				...(tags.candidates || []).slice(0, 4),
+				...seriesForms(tags, names),
+				...plainForms(names)
+			].map(tagForm).filter(Boolean))].slice(0, 10);
 			for (const candidate of tries) {
 				const hit = matchTag(candidate, await naiSuggest(candidate));
 				if (hit) {
@@ -12250,8 +12307,8 @@ ${lore}`;
 	}
 	async function generateImageTags(contact, lore, botName) {
 		const prompt = `인물 "${contact.name}"의 그림을 NovelAI로 그리기 위한 태그를 만든다. 봇 이름: "${botName}".
-- character_tags: 이 인물이 기존 작품(애니메이션·게임·만화·소설 등)의 공식 캐릭터라면 Danbooru 캐릭터 태그 후보를 가능성이 높은 순으로 최대 3개 쓴다. 소문자, 밑줄 대신 공백, Danbooru가 쓰는 경우 "(작품)" 한정자를 붙인다. 예: "saber (fate)", "takanashi hoshino". 이름 순서가 다른 표기도 후보가 될 수 있다. 이 봇만의 창작 인물이거나 확실하지 않으면 빈 배열이다.
-- copyright: 그 작품의 Danbooru 작품 태그. 예: "blue archive". 모르면 빈 문자열.
+- character_tags: 이 인물이 기존 작품(애니메이션·게임·만화·소설 등)의 공식 캐릭터라면 Danbooru 캐릭터 태그 후보를 가능성이 높은 순으로 최대 3개 쓴다. 소문자, 밑줄 대신 공백, Danbooru가 쓰는 경우 "(작품)" 한정자를 붙인다. 예: "saber (fate)", "takanashi hoshino". 이름 순서가 다른 표기도 후보가 될 수 있다. 확실하지 않아도 비우지 않는다: 로어에 적힌 영문 이름(없으면 로마자 표기)으로 "이름 성", "이름 (작품)" 같은 후보를 쓴다. 후보는 NovelAI에서 확인한 뒤에만 쓰인다. 이 봇만의 창작 인물임이 분명할 때만 빈 배열이다.
+- copyright: 그 작품의 Danbooru 작품 태그. 예: "blue archive". 로어에 작품명이 없어도 봇 이름이 작품명이면 그 작품 태그를 쓴다. 모르면 빈 문자열.
 - gender: girl, boy, other 중 하나.
 - looks: 바뀌지 않는 외형을 영어 Danbooru 태그로 쉼표로 나눠 쓴다. 머리색, 머리 길이와 모양, 눈색, 체형, 늘 달고 있는 장신구(헤일로, 머리장식 등). 옷과 신발은 쓰지 않는다.
 - outfit: 평소 옷차림을 영어 Danbooru 태그로 쉼표로 나눠 쓴다. 옷, 신발, 모자. 최대 15개. 로어에 쓰인 외형을 우선하고, 로어에 없으면 공식 캐릭터일 때만 널리 알려진 기본 외형으로 채운다. 표정, 자세, 배경, 이름은 쓰지 않는다. 최대 25개.
@@ -12298,12 +12355,25 @@ ${lore || "(로어 항목 없음)"}`;
 				if (saved?.schema === 1 && saved.lore === lore && saved.tags?.schema === 1) tags = saved.tags;
 			}
 			if (tags) {
-				if (needsRecheck(tags)) await checkImageTags(tags, personNames(contact, books));
+				if (needsRecheck(tags)) await checkImageTags(tags, [...personNames(contact, books), ...loreNames(lore)], ctx.char.name);
 				contact.imageTags = tags;
 				return tags;
 			}
 		}
-		const tags = await checkImageTags(await generateImageTags(contact, lore, ctx.char.name), personNames(contact, books));
+		const prev = contact.imageTags?.schema === 1 ? contact.imageTags : null;
+		const userCharacter = tagForm(prev?.userCharacter ?? (prev?.manual ? prev.candidates?.[0] : ""));
+		const userCopyright = tagForm(prev?.userCopyright ?? (prev?.manual ? prev.copyrightGuess || prev.copyright : ""));
+		const made = await generateImageTags(contact, lore, ctx.char.name);
+		if (userCharacter) Object.assign(made, {
+			userCharacter,
+			candidates: [userCharacter, ...made.candidates.filter((t) => t !== userCharacter)]
+		});
+		if (userCopyright) Object.assign(made, {
+			userCopyright,
+			copyright: userCopyright
+		});
+		if (prev?.looksMode) made.looksMode = prev.looksMode;
+		const tags = await checkImageTags(made, [...personNames(contact, books), ...loreNames(lore)], ctx.char.name);
 		tags.loreHash = loreHash(lore);
 		contact.imageTags = tags;
 		await storeImageTags(ctx.char.chaId, contact, lore, tags);
@@ -12336,6 +12406,13 @@ ${lore || "(로어 항목 없음)"}`;
 		};
 	}
 	const tagParts = (t) => splitOutfit(t?.looks, t?.outfit || "");
+	const LOOKS_WEIGHT = .6;
+	const looksModeOf = (t) => t?.looksMode === "on" || t?.looksMode === "off" ? t.looksMode : "weak";
+	const charLooks = (t, looks) => {
+		if (!looks) return "";
+		const mode = looksModeOf(t);
+		return mode === "off" ? "" : mode === "on" ? looks : `${LOOKS_WEIGHT}::${looks} ::`;
+	};
 	function coveringNegative(base, chars, negative) {
 		return coveringAuto(base, chars, negative).negative;
 	}
@@ -12425,7 +12502,7 @@ ${lore || "(로어 항목 없음)"}`;
 				t.gender || "girl",
 				registered ? t.character : "",
 				registered && t.copyright ? t.copyright : "",
-				looks,
+				registered ? charLooks(t, looks) : looks,
 				wearing || (sceneAttire ? "" : parts.outfit),
 				nude && !/\bcompletely nude\b/.test(wearing) ? "completely nude" : ""
 			].filter(Boolean).join(", ");
